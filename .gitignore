@@ -6,3 +6,6 @@ __pycache__/
 # Environments
 .venv
 venv/
+
+# keys/certs
+authenticator/*.pem
