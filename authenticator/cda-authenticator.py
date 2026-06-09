@@ -188,7 +188,7 @@ def handle_get_info():
     info = {
         1: ['FIDO_2_0', 'FIDO_2_1'],       # versions
         2: [],                              # extensions
-        3: secrets.token_bytes(16),         # aaguid (random per-instance)
+        3: bytes.fromhex('aaf6ecbd9da0e23f57350e03e6667ea1'),  # aaguid
         4: {'rk': False, 'up': True, 'uv': False},
         5: 1024,                            # maxMsgSize
         9: ['hybrid'],                      # transports
