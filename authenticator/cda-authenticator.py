@@ -5,6 +5,7 @@
 
 import sys
 import os
+import json
 import datetime
 import asyncio
 import threading
@@ -20,6 +21,9 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.serialization import (
+    Encoding, PrivateFormat, NoEncryption, load_pem_private_key,
+)
 
 from websockets import serve
 
@@ -186,8 +190,61 @@ CTAP_FRAME_SHUTDOWN      = 0x00
 
 AAGUID = bytes.fromhex('aaf6ecbd9da0e23f57350e03e6667ea1')
 
-# rpId -> list of {credentialId, privateKey, publicKey, user, signCount}
-credential_store = {}
+CREDENTIAL_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'credentials.json')
+
+
+def _serialize_user(user):
+    out = dict(user)
+    if isinstance(out.get('id'), (bytes, bytearray)):
+        out['id'] = out['id'].hex()
+    return out
+
+
+def _deserialize_user(user):
+    out = dict(user)
+    if 'id' in out:
+        out['id'] = bytes.fromhex(out['id'])
+    return out
+
+
+def _load_credential_store():
+    if not os.path.exists(CREDENTIAL_STORE_PATH):
+        return {}
+    with open(CREDENTIAL_STORE_PATH) as f:
+        data = json.load(f)
+    store = {}
+    for rp_id, creds in data.items():
+        store[rp_id] = []
+        for c in creds:
+            store[rp_id].append({
+                'credentialId': bytes.fromhex(c['credentialId']),
+                'privateKey':   load_pem_private_key(c['privateKey'].encode(), password=None),
+                'user':         _deserialize_user(c['user']),
+                'signCount':    c['signCount'],
+            })
+    return store
+
+
+def _save_credential_store():
+    data = {}
+    for rp_id, creds in credential_store.items():
+        data[rp_id] = []
+        for c in creds:
+            data[rp_id].append({
+                'credentialId': c['credentialId'].hex(),
+                'privateKey':   c['privateKey'].private_bytes(
+                    Encoding.PEM, PrivateFormat.PKCS8, NoEncryption(),
+                ).decode(),
+                'user':         _serialize_user(c['user']),
+                'signCount':    c['signCount'],
+            })
+    with open(CREDENTIAL_STORE_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Credential store saved ({sum(len(v) for v in data.values())} credential(s))")
+
+
+# rpId -> list of {credentialId, privateKey, user, signCount}
+credential_store = _load_credential_store()
 
 
 def _build_auth_data(rp_id, flags, sign_count, attested_cred_data=b''):
@@ -230,6 +287,7 @@ def handle_make_credential(request_cbor):
         'user':         user,
         'signCount':    0,
     })
+    _save_credential_store()
 
     cose_key = dumps({
         1: 2, 3: -7, -1: 1,
@@ -262,6 +320,7 @@ def handle_get_assertion(request_cbor):
 
     cred = creds[0]
     cred['signCount'] += 1
+    _save_credential_store()
 
     auth_data = _build_auth_data(rp_id, 0x01, cred['signCount'])  # UP
     signature = cred['privateKey'].sign(auth_data + client_data_hash, ec.ECDSA(hashes.SHA256()))
