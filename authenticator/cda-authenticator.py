@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from websockets.server import serve
+from websockets import serve
 
 # BLE
 import dbus
