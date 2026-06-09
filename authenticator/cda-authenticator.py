@@ -300,8 +300,8 @@ def _channel_decrypt(cipher, ciphertext: bytes) -> bytes:
     return unpad_message(cipher.decrypt_with_ad(b"", ciphertext))
 
 
-async def handler(websocket, path):
-    print(f"Connection from path: {path}")
+async def handler(websocket):
+    print(f"Connection from path: {websocket.request.path}")
 
     # Build a fresh handshake state for this connection.
     # The client's static key (from the QR) is pre-shared (KNpsk0 prologue).
