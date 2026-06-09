@@ -436,6 +436,10 @@ async def handler(websocket):
 
         response_frame = bytes([CTAP_FRAME_CTAP]) + ctap_response
         await websocket.send(_channel_encrypt(send_cipher, response_frame))
+        break
+
+    print("Session complete -- exiting.")
+    mainloop.quit()
 
 
 async def main():
