@@ -3,316 +3,418 @@
 # FIDO CDA Authenticator using CTAP hybrid transport
 # https://fidoalliance.org/specs/fido-v2.2-ps-20250228/fido-client-to-authenticator-protocol-v2.2-ps-20250228.html#sctn-hybrid
 
-import sys # argv
+import sys
 import os
 import datetime
-# WS
-import asyncio, threading
+import asyncio
+import threading
+import hmac
+import hashlib
+import secrets
+import ssl
+
+from cbor2 import loads, dumps
+
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
 from websockets.server import serve
+
 # BLE
 import dbus
 import dbus.exceptions
 import dbus.service
 import dbus.mainloop.glib
 from gi.repository import GLib
-# crypto
-import hmac
-import hashlib
-import secrets
-import ssl
-from cbor2 import loads, dumps
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.backends import default_backend
-# noise
-from noise.connection import NoiseConnection, Keypair
+
+from cable_noise import (
+    NoiseHandshake, KeyPair, generate_keypair,
+    deserialize_public_key_compressed, serialize_public_key,
+    pad_message, unpad_message,
+    PATTERN_KN_PSK0,
+)
 
 ### FIDO URIs ###
 
-def fido_encode(data):
-  # CBOR-encode input dict
-  cbor_data = dumps(data)
-  print(cbor_data)
-  # group in chuncks of 7 bytes
-  n = 7
-  chunks = [cbor_data[i:i + n][::-1] for i in range(0, len(cbor_data), n)]
-  print(chunks)
-  # convert chunks to decimals
-  decimals = [ str(int.from_bytes(b, "little")) for b in chunks ]
-  print(decimals)
-  return "".join( [ i.rjust(17,"0") for i in decimals[:-1]] + [ decimals[-1] ] )
+# Chunk-width table matching the client's base10 encoder (CTAP 2.3 §11.5).
+# Maps digit-string width -> byte-chunk size; greedy-largest-first decode.
+_DIGIT_WIDTH_TO_CHUNK_SIZE = {17: 7, 15: 6, 13: 5, 10: 4, 8: 3, 5: 2, 3: 1}
+_WIDTHS_DESC = sorted(_DIGIT_WIDTH_TO_CHUNK_SIZE, reverse=True)
+
 
 def fido_decode(s):
-  assert( s.startswith('FIDO:/') )
-  s = s.lstrip('FIDO:/')
-  chunkSize = 17
-  chunks = [ s[i:i + chunkSize] for i in range(0, len(s), chunkSize) ]
-  parts = [ int(chunk).to_bytes(7,"little") for chunk in chunks ]
-  parts[-1].lstrip(b'\0')
-  return loads(b''.join(parts))
+    assert s.startswith('FIDO:/'), f"not a FIDO URI: {s!r}"
+    digits = s[len('FIDO:/'):]
+    out = bytearray()
+    pos = 0
+    while pos < len(digits):
+        remaining = len(digits) - pos
+        for w in _WIDTHS_DESC:
+            if w <= remaining:
+                chunk_size = _DIGIT_WIDTH_TO_CHUNK_SIZE[w]
+                out += int(digits[pos:pos + w]).to_bytes(chunk_size, 'little')
+                pos += w
+                break
+        else:
+            raise ValueError(f"leftover {remaining} digit(s) don't match any chunk width")
+    return loads(bytes(out))
+
 
 ### Key Derivation ###
 
-# TODO move to common code
 keyPurposeEIDKey   = bytes.fromhex('01000000')
 keyPurposeTunnelID = bytes.fromhex('02000000')
 keyPurposePSK      = bytes.fromhex('03000000')
 
-def derive(secret, salt=b'', purpose=None):
-    hkdf = HKDF( algorithm=hashes.SHA256(), length=64, salt=salt, info=purpose)
-    key = hkdf.derive(secret)
-    return key
 
-### Encryption ###
+def derive(secret, salt=b'', purpose=None, length=64):
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=purpose)
+    return hkdf.derive(secret)
 
-""" encrypt 16-byte plaintext with 64-byte eidKey and append 4-byte HMAC"""
-def encrypt(eidKey, plaintext):
+
+### BLE Encryption ###
+
+def encrypt_eid(eidKey, plaintext):
+    """Encrypt 16-byte EID plaintext: AES-256-ECB + 4-byte HMAC-SHA256 tag."""
     aesKey = eidKey[:32]
     hmacKey = eidKey[32:]
     cipher = Cipher(algorithms.AES(aesKey), modes.ECB())
     encryptor = cipher.encryptor()
     ciphertext = encryptor.update(plaintext) + encryptor.finalize()
-    h = hmac.new(hmacKey, ciphertext, hashlib.sha256).digest()
-    return b''.join([ ciphertext, h[:4]])
+    tag = hmac.new(hmacKey, ciphertext, hashlib.sha256).digest()[:4]
+    return ciphertext + tag
 
 
-### BLE ###
+### BLE Advertisement ###
 
 ADAPTER_NAME = "hci0"
 BLUEZ_SERVICE_NAME = "org.bluez"
 BLUEZ_NAMESPACE = "/org/bluez/"
-DBUS_PROPERTIES="org.freedesktop.DBus.Properties"
+DBUS_PROPERTIES = "org.freedesktop.DBus.Properties"
 ADVERTISEMENT_INTERFACE = BLUEZ_SERVICE_NAME + ".LEAdvertisement1"
 ADVERTISING_MANAGER_INTERFACE = BLUEZ_SERVICE_NAME + ".LEAdvertisingManager1"
+FIDO_UUID = '0000fff9-0000-1000-8000-00805f9b34fb'
 
-# UUID 0xFFF9: FIDO2 secure client-to-authenticator transport
-FIDO_UUID = '0000fff9-0000-1000-8000-00805f9b34fb' # FIDO Service Discovery
 
 class InvalidArgsException(dbus.exceptions.DBusException):
     _dbus_error_name = 'org.freedesktop.DBus.Error.InvalidArgs'
 
-# much of this code was copied or inspired by test\example-advertisement in the BlueZ source
+
 class Advertisement(dbus.service.Object):
-  PATH_BASE = '/org/bluez/ldsg/advertisement'
+    PATH_BASE = '/org/bluez/ldsg/advertisement'
 
-  def __init__(self, bus, index, advertising_type, service_data = None):
-    self.path = self.PATH_BASE + str(index)
-    self.bus = bus
-    self.ad_type = advertising_type
-    self.service_uuids = None
-    self.manufacturer_data = None
-    self.solicit_uuids = None
-    self.service_data = service_data
-    self.local_name = None
-    self.include_tx_power = False
-    self.data = None
-    #self.discoverable = True
-    dbus.service.Object.__init__(self, bus, self.path)
+    def __init__(self, bus, index, advertising_type, service_data=None):
+        self.path = self.PATH_BASE + str(index)
+        self.bus = bus
+        self.ad_type = advertising_type
+        self.service_uuids = None
+        self.manufacturer_data = None
+        self.solicit_uuids = None
+        self.service_data = service_data
+        self.local_name = None
+        self.include_tx_power = False
+        self.data = None
+        dbus.service.Object.__init__(self, bus, self.path)
 
-  def get_properties(self):
-    properties = dict()
-    properties['Type'] = self.ad_type
-    if self.service_uuids is not None:
-      properties['ServiceUUIDs'] = dbus.Array(self.service_uuids, signature='s')
-    if self.solicit_uuids is not None:
-      properties['SolicitUUIDs'] = dbus.Array(self.solicit_uuids, signature='s')
-    if self.manufacturer_data is not None:
-      properties['ManufacturerData'] = dbus.Dictionary( self.manufacturer_data, signature='qv')
-    if self.service_data is not None:
-      properties['ServiceData'] = dbus.Dictionary(self.service_data, signature='sv')
-    if self.local_name is not None:
-      properties['LocalName'] = dbus.String(self.local_name)
-    #if self.discoverable is not None and self.discoverable == True:
-      #properties['Discoverable'] = dbus.Boolean(self.discoverable)
-    if self.include_tx_power:
-      properties['Includes'] = dbus.Array(["tx-power"], signature='s')
-    if self.data is not None:
-      properties['Data'] = dbus.Dictionary( self.data, signature='yv')
-    print(properties)
-    return {ADVERTISING_MANAGER_INTERFACE: properties}
+    def get_properties(self):
+        properties = dict()
+        properties['Type'] = self.ad_type
+        if self.service_uuids is not None:
+            properties['ServiceUUIDs'] = dbus.Array(self.service_uuids, signature='s')
+        if self.solicit_uuids is not None:
+            properties['SolicitUUIDs'] = dbus.Array(self.solicit_uuids, signature='s')
+        if self.manufacturer_data is not None:
+            properties['ManufacturerData'] = dbus.Dictionary(self.manufacturer_data, signature='qv')
+        if self.service_data is not None:
+            properties['ServiceData'] = dbus.Dictionary(self.service_data, signature='sv')
+        if self.local_name is not None:
+            properties['LocalName'] = dbus.String(self.local_name)
+        if self.include_tx_power:
+            properties['Includes'] = dbus.Array(["tx-power"], signature='s')
+        if self.data is not None:
+            properties['Data'] = dbus.Dictionary(self.data, signature='yv')
+        print(properties)
+        return {ADVERTISING_MANAGER_INTERFACE: properties}
 
-  def get_path(self):
-    return dbus.ObjectPath(self.path)
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
 
-  @dbus.service.method(DBUS_PROPERTIES, in_signature='s', out_signature='a{sv}')
-  def GetAll(self, interface):
-    if interface != ADVERTISEMENT_INTERFACE:
-      raise InvalidArgsException()
-    return self.get_properties()[ADVERTISING_MANAGER_INTERFACE]
+    @dbus.service.method(DBUS_PROPERTIES, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface):
+        if interface != ADVERTISEMENT_INTERFACE:
+            raise InvalidArgsException()
+        return self.get_properties()[ADVERTISING_MANAGER_INTERFACE]
 
-  @dbus.service.method(ADVERTISING_MANAGER_INTERFACE, in_signature='', out_signature='')
-  def Release(self):
-    print('%s: Released' % self.path)
+    @dbus.service.method(ADVERTISING_MANAGER_INTERFACE, in_signature='', out_signature='')
+    def Release(self):
+        print('%s: Released' % self.path)
 
 
 def register_ad_cb():
-  print('Advertisement registered OK')
+    print('Advertisement registered OK')
+
 
 def register_ad_error_cb(error):
-  print('Error: Failed to register advertisement: ' + str(error))
-  mainloop.quit()
+    print('Error: Failed to register advertisement: ' + str(error))
+    mainloop.quit()
+
 
 def start_advertising():
-  global adv
-  global adv_mgr_interface
-  # we're only registering one advertisement object so index (arg2) is hard coded as 0
-  print("Registering advertisement",adv.get_path())
-  adv_mgr_interface.RegisterAdvertisement(adv.get_path(), {}, reply_handler=register_ad_cb, error_handler=register_ad_error_cb)
-
-### FIDO.CABLE ###
-
-name = b"Noise_KNpsk0_P256_AESGCM_SHA256"
-#name = b"Noise_KNpsk0_25519_AESGCM_SHA256" # TEMP
-responder = NoiseConnection.from_name(name)
+    global adv, adv_mgr_interface
+    print("Registering advertisement", adv.get_path())
+    adv_mgr_interface.RegisterAdvertisement(
+        adv.get_path(), {},
+        reply_handler=register_ad_cb,
+        error_handler=register_ad_error_cb,
+    )
 
 
+### CTAP command handlers ###
 
-# Naive implementation of the WebSockets fido.cable subprotocol
+CTAP_GET_INFO        = 0x04
+CTAP_GET_ASSERTION   = 0x02
+CTAP_MAKE_CREDENTIAL = 0x01
+CTAP_STATUS_OK       = 0x00
+CTAP_ERR_INVALID_COMMAND      = 0x01
+CTAP_ERR_NO_CREDENTIALS       = 0x2E
+CTAP_ERR_NOT_ALLOWED          = 0x30
+CTAP_FRAME_CTAP     = 0x01
+CTAP_FRAME_SHUTDOWN = 0x00
 
-# TODO: multiple paths
+
+def handle_get_info():
+    """Return a minimal authenticatorGetInfo response."""
+    info = {
+        1: ['FIDO_2_0', 'FIDO_2_1'],       # versions
+        2: [],                              # extensions
+        3: secrets.token_bytes(16),         # aaguid (random per-instance)
+        4: {'rk': False, 'up': True, 'uv': False},
+        5: 1024,                            # maxMsgSize
+        9: ['hybrid'],                      # transports
+    }
+    return bytes([CTAP_STATUS_OK]) + dumps(info)
+
+
+def handle_get_assertion(request_cbor):
+    # Minimal stub: we have no credential store, so always return NO_CREDENTIALS.
+    # Replace with real credential lookup and signing for a full implementation.
+    print(f"  GetAssertion: {loads(request_cbor)}")
+    return bytes([CTAP_ERR_NO_CREDENTIALS])
+
+
+def handle_make_credential(request_cbor):
+    # Minimal stub: credential creation requires a real key store.
+    # Replace with actual key generation, attestation, etc.
+    print(f"  MakeCredential: {loads(request_cbor)}")
+    return bytes([CTAP_ERR_NOT_ALLOWED])
+
+
+def dispatch_ctap(request: bytes) -> bytes:
+    """Dispatch a raw CTAP request byte string; return raw CTAP response."""
+    if not request:
+        return bytes([CTAP_ERR_INVALID_COMMAND])
+    cmd = request[0]
+    body = request[1:]
+    if cmd == CTAP_GET_INFO:
+        return handle_get_info()
+    if cmd == CTAP_GET_ASSERTION:
+        return handle_get_assertion(body)
+    if cmd == CTAP_MAKE_CREDENTIAL:
+        return handle_make_credential(body)
+    print(f"  Unknown CTAP command 0x{cmd:02x}")
+    return bytes([CTAP_ERR_INVALID_COMMAND])
+
+
+### Tunnel / WebSocket handler ###
+
+def _channel_encrypt(cipher, plaintext: bytes) -> bytes:
+    return cipher.encrypt_with_ad(b"", pad_message(plaintext))
+
+
+def _channel_decrypt(cipher, ciphertext: bytes) -> bytes:
+    return unpad_message(cipher.decrypt_with_ad(b"", ciphertext))
+
+
 async def handler(websocket, path):
-    print(f"Path: {path}")
-    print(f"starting handshake I>R")
-    responder.start_handshake()
-    # -> psk, e
+    print(f"Connection from path: {path}")
 
-    handshake1 = await websocket.recv()
-    print(f"Received --> psk, e: {handshake1.hex()}")
-    # this is the KNpsk0 initiator (client/browser) handshake message, consisting of an uncompressed P256 ephemeral key (ie 65 bytes) and a 16 byte encrypted empty message
-    empty = responder.read_message(handshake1)
-    print(empty.hex())
-    #assert empty == b''
+    # Build a fresh handshake state for this connection.
+    # The client's static key (from the QR) is pre-shared (KNpsk0 prologue).
+    hs = NoiseHandshake(
+        pattern=PATTERN_KN_PSK0,
+        role="responder",
+        remote_static_public=client_pubkey_uncompressed,
+        psk=psk,
+    )
 
-    # <- e, ee, se
-    handshake2 = responder.write_message()
-    print(f"Sending response: {handshake2.hex()}")
-    await websocket.send(handshake2)
-    assert responder.handshake_finished
-    print(f"handshake finished")
+    # -> psk, e  (initiator's first message)
+    msg1 = await websocket.recv()
+    print(f"Received handshake msg1 ({len(msg1)} bytes): {msg1.hex()}")
+    hs.read_message(msg1)
 
-    # TEST - rev string
-    message = await websocket.recv()
-    print(f"Received: {message.hex()}")
-    plaintext = responder.decrypt(message)
-    print(f"Plaintext: {plaintext}")
-    rev = plaintext[::-1]
-    ciphertext = responder.encrypt(rev)
-    print(f"Ciphertext: {ciphertext.hex()}")
-    await websocket.send(ciphertext)
+    # <- e, ee, se  (responder's reply)
+    msg2 = hs.write_message()
+    print(f"Sending handshake msg2 ({len(msg2)} bytes): {msg2.hex()}")
+    await websocket.send(msg2)
+
+    result = hs.finish()
+    print("Noise handshake complete.")
+
+    send_cipher    = result.send_cipher
+    receive_cipher = result.receive_cipher
+
+    # Post-handshake mandatory message: send our cached authenticatorGetInfo
+    # response as a bare CBOR wrapper map {1: cbor_encoded_info_bytes}.
+    # The client reads this BEFORE sending any CTAP requests (CTAP 2.3
+    # sctn-hybrid "readPostHandshakeMessage"); it does NOT have a type byte.
+    info_response = handle_get_info()
+    # info_response is b'\x00' + cbor(info_map); strip the status byte --
+    # the embedded bytes are just the raw cbor(info_map).
+    info_cbor = info_response[1:]
+    post_handshake = dumps({1: info_cbor})
+    await websocket.send(_channel_encrypt(send_cipher, post_handshake))
+    print("Sent post-handshake cached getInfo.")
+
+    # CTAP request/response loop.
+    # Each frame: decrypt -> unpad -> [type_byte(0x01)] || ctap_request
+    #             encrypt  <- pad  <- [type_byte(0x01)] || ctap_response
+    while True:
+        try:
+            raw = await websocket.recv()
+        except Exception as exc:
+            print(f"Connection closed: {exc}")
+            break
+
+        try:
+            plaintext = _channel_decrypt(receive_cipher, raw)
+        except Exception as exc:
+            print(f"Decryption failed: {exc}")
+            break
+
+        if not plaintext:
+            print("Empty frame -- ignoring")
+            continue
+
+        frame_type = plaintext[0]
+        payload    = plaintext[1:]
+
+        if frame_type == CTAP_FRAME_SHUTDOWN:
+            print("Client sent Shutdown frame -- closing.")
+            break
+
+        if frame_type != CTAP_FRAME_CTAP:
+            print(f"Unexpected frame type 0x{frame_type:02x} -- ignoring")
+            continue
+
+        print(f"CTAP request ({len(payload)} bytes): cmd=0x{payload[0]:02x}" if payload else "CTAP request (empty)")
+        ctap_response = dispatch_ctap(payload)
+        print(f"CTAP response ({len(ctap_response)} bytes): status=0x{ctap_response[0]:02x}")
+
+        response_frame = bytes([CTAP_FRAME_CTAP]) + ctap_response
+        await websocket.send(_channel_encrypt(send_cipher, response_frame))
+
 
 async def main():
-    # Generate out-of-band with Lets Encrypt, chown to current user and 400 permissions
     ssl_cert = "fullchain.pem"
-    ssl_key = "privkey.pem"
+    ssl_key  = "privkey.pem"
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain(ssl_cert, keyfile=ssl_key)
-    server = await serve(handler, host="0.0.0.0", port=443, subprotocols=["fido.cable"], ssl=ssl_context)
-    #server = await serve(handler, host=None, port=2222)
+    server = await serve(handler, host="0.0.0.0", port=443,
+                         subprotocols=["fido.cable"], ssl=ssl_context)
     await server.wait_closed()
+
 
 def run_asyncio():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete( main() )
+    loop.run_until_complete(main())
     loop.run_forever()
 
 
-### SETUP ###
+### Setup ###
 
 if os.getuid() != 0:
-        print(f"Need root!")
-        sys.exit(1)
-
-if len(sys.argv) < 2:
-        print(f"Need a FIDO URI!")
-        sys.exit(1)
-fido_uri = sys.argv[1]
-
-# Decode FIDO URI
-
-decoded = fido_decode(fido_uri)
-print(f"Decoded FIDO URI:\n {decoded}")
-
-labels = [ "public key", "shared secret", "known tunnel domains", "timestamp", "state-assisted", "flow hint" ]
-for k,v in decoded.items():
-    pass
-    #print(labels[k], v.hex() if isinstance(v, (bytes, bytearray)) else v)
-
-try:
-    pubKey = decoded[0] # a 33-byte, P-256, X9.62, compressed public key
-    print(f"Client's static Public Key: { pubKey.hex() }")
-    qrSecret = decoded[1]   # 16-byte random QR secret
-    print(f"Shared secret: { qrSecret.hex() }")
-    _ = decoded[2]  # number of assigned tunnel server domains known to this implementation
-    timestamp = decoded[3] # current time in epoch seconds
-    print(f"time: { datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S') }")
-    _ = decoded[4]  # true if the device displaying the QR code can perform state-assisted transactions (e.g. Chrome)
-    cmd = decoded[5]    # ga (get assertion) or mc (make credential)
-    assert cmd == 'ga'
-except KeyError as error:
-    print(f"Key not Found: { error } ")
+    print("Need root!")
     sys.exit(1)
 
-#
+if len(sys.argv) < 2:
+    print("Usage: cda-authenticator.py <FIDO-URI>")
+    sys.exit(1)
 
-eidKey = derive(qrSecret, purpose=keyPurposeEIDKey) # no salt
-print(f"EID Key: { eidKey.hex() }")
+fido_uri = sys.argv[1]
 
+decoded = fido_decode(fido_uri)
+print(f"Decoded FIDO URI: {decoded}")
 
-# Construct payload for BLE advertisement:
-# flag(1) | nonce(10) | routingID(3) | tunnel ID(2)
+try:
+    compressed_pubkey = decoded[0]  # 33-byte compressed P-256 public key
+    print(f"Client static pubkey (compressed):   {compressed_pubkey.hex()}")
 
-flags = b'\0'
-nonce = secrets.token_bytes(10)
-routingID = secrets.token_bytes(3)
-# 0x0000 = Google (cable.ua5v.com), 0x0100 = Apple (cable.auth.com), ..., 0x0001 = cable.qz2ekwmnd332c.info
-tunnel_serviceID = b'\x05\x01' # cable.pyzci7hxyjsvc.org
+    # Decompress to 65-byte uncompressed form -- required for DH and the
+    # caBLE Noise prologue (which mixes the uncompressed encoding).
+    client_pubkey_obj = deserialize_public_key_compressed(compressed_pubkey)
+    client_pubkey_uncompressed = serialize_public_key(client_pubkey_obj)
+    print(f"Client static pubkey (uncompressed): {client_pubkey_uncompressed.hex()}")
 
-payload = b''.join([ flags, nonce, routingID, tunnel_serviceID ])
-print(f"Payload: { payload.hex() }")
+    qrSecret = decoded[1]  # 16-byte QR secret
+    print(f"QR secret: {qrSecret.hex()}")
 
-# encrypt payload to prove proximity to the client
-serviceData = encrypt(eidKey, payload)
-print(f"Encrypted Payload: { serviceData.hex() }")
+    timestamp = decoded[3]
+    print(f"Timestamp: {datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')}")
 
-print(f"deriving psk from shared secret {qrSecret.hex()} and advertisement plaintext {payload.hex()}")
-psk = derive(qrSecret, payload, keyPurposePSK)  # payload is used as salt
-print(f"psk: { psk.hex() }")
+    cmd = decoded[5]  # 'ga' or 'mc'
+    print(f"Request type: {cmd}")
+    # Both 'ga' and 'mc' are handled at the CTAP dispatch layer -- no assertion here.
 
-psk = psk[:32] # TODO: is this correct?
-responder.set_psks(psk)
+except KeyError as exc:
+    print(f"Missing required FIDO URI field: {exc}")
+    sys.exit(1)
 
-responder.set_keypair_from_public_bytes(Keypair.REMOTE_STATIC, pubKey)
-responder.set_as_responder()
+# Derive EID key and construct BLE advertisement plaintext.
+eidKey = derive(qrSecret, purpose=keyPurposeEIDKey)
+print(f"EID key: {eidKey.hex()}")
 
-# TODO: is psk derived from unencrypted (patload) or encrypted (serviceData) ??
+flags      = b'\x00'
+nonce      = secrets.token_bytes(10)
+routingID  = secrets.token_bytes(3)
+# tunnel_serviceID: 2-byte little-endian domain index.
+# 0x0005 = custom domain (cable.pyzci7hxyjsvc.org) used by this Pi server.
+tunnel_serviceID = b'\x05\x01'
 
-# start tunnel service
-threading.Thread(target=run_asyncio).start()
+eid_plaintext = flags + nonce + routingID + tunnel_serviceID
+print(f"EID plaintext: {eid_plaintext.hex()}")
 
-### Mainloop / asyncio
+serviceData = encrypt_eid(eidKey, eid_plaintext)
+print(f"EID encrypted: {serviceData.hex()}")
+
+# Derive PSK from QR secret salted with the EID plaintext (CTAP 2.3 §11.5
+# "derive(qrSecret, eid, keyPurposePSK)").
+psk = derive(qrSecret, salt=eid_plaintext, purpose=keyPurposePSK, length=32)
+print(f"PSK: {psk.hex()}")
+
+# Start WebSocket tunnel server in a background thread.
+threading.Thread(target=run_asyncio, daemon=True).start()
+
+### BLE advertising ###
 
 dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 bus = dbus.SystemBus()
-# we're assuming the adapter supports advertising
-adapter_path = BLUEZ_NAMESPACE + ADAPTER_NAME
-print(f"BLE Adapter path: {adapter_path}")
 
-adv_mgr_interface = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME,adapter_path), ADVERTISING_MANAGER_INTERFACE)
-# service data
-serviceDict = { FIDO_UUID : dbus.Array(serviceData, signature='y') }
-# we're only registering one advertisement object so index (arg2) is hard coded as 0
+adapter_path = BLUEZ_NAMESPACE + ADAPTER_NAME
+print(f"BLE adapter: {adapter_path}")
+adv_mgr_interface = dbus.Interface(
+    bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
+    ADVERTISING_MANAGER_INTERFACE,
+)
+
+serviceDict = {FIDO_UUID: dbus.Array(serviceData, signature='y')}
 adv = Advertisement(bus, 0, 'broadcast', dbus.Dictionary(serviceDict, signature='sv'))
 start_advertising()
 
-# TODO: handle KeyboardInterrupt
 try:
     mainloop = GLib.MainLoop()
     mainloop.run()
 except KeyboardInterrupt:
-    print("Attempting graceful shutdown, press Ctrl+C again to exit...", flush=True)
+    print("Shutting down...")
     mainloop.quit()
-
