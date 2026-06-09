@@ -12,12 +12,14 @@ import hmac
 import hashlib
 import secrets
 import ssl
+import struct
 
 from cbor2 import loads, dumps
 
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from websockets import serve
 
@@ -176,45 +178,107 @@ CTAP_GET_INFO        = 0x04
 CTAP_GET_ASSERTION   = 0x02
 CTAP_MAKE_CREDENTIAL = 0x01
 CTAP_STATUS_OK       = 0x00
-CTAP_ERR_INVALID_COMMAND      = 0x01
-CTAP_ERR_NO_CREDENTIALS       = 0x2E
-CTAP_ERR_NOT_ALLOWED          = 0x30
-CTAP_FRAME_CTAP     = 0x01
-CTAP_FRAME_SHUTDOWN = 0x00
+CTAP_ERR_INVALID_COMMAND = 0x01
+CTAP_ERR_NO_CREDENTIALS  = 0x2E
+CTAP_ERR_NOT_ALLOWED     = 0x30
+CTAP_FRAME_CTAP          = 0x01
+CTAP_FRAME_SHUTDOWN      = 0x00
+
+AAGUID = bytes.fromhex('aaf6ecbd9da0e23f57350e03e6667ea1')
+
+# rpId -> list of {credentialId, privateKey, publicKey, user, signCount}
+credential_store = {}
+
+
+def _build_auth_data(rp_id, flags, sign_count, attested_cred_data=b''):
+    rp_id_hash = hashlib.sha256(rp_id.encode()).digest()
+    return rp_id_hash + bytes([flags]) + struct.pack('>I', sign_count) + attested_cred_data
 
 
 def handle_get_info():
-    """Return a minimal authenticatorGetInfo response."""
     info = {
-        1: ['FIDO_2_0', 'FIDO_2_1'],       # versions
-        2: [],                              # extensions
-        3: bytes.fromhex('aaf6ecbd9da0e23f57350e03e6667ea1'),  # aaguid
+        1: ['FIDO_2_0', 'FIDO_2_1'],
+        2: [],
+        3: AAGUID,
         4: {'rk': False, 'up': True, 'uv': False},
-        5: 1024,                            # maxMsgSize
-        9: ['hybrid'],                      # transports
+        5: 1024,
+        9: ['hybrid'],
     }
     return bytes([CTAP_STATUS_OK]) + dumps(info)
 
 
-def handle_get_assertion(request_cbor):
-    # Minimal stub: we have no credential store, so always return NO_CREDENTIALS.
-    # Replace with real credential lookup and signing for a full implementation.
-    print(f"  GetAssertion: {loads(request_cbor)}")
-    return bytes([CTAP_ERR_NO_CREDENTIALS])
-
-
 def handle_make_credential(request_cbor):
-    # Minimal stub: credential creation requires a real key store.
-    # Replace with actual key generation, attestation, etc.
-    print(f"  MakeCredential: {loads(request_cbor)}")
-    return bytes([CTAP_ERR_NOT_ALLOWED])
+    req = loads(request_cbor)
+    print(f"  MakeCredential: {req}")
+
+    client_data_hash    = req[1]
+    rp                  = req[2]
+    user                = req[3]
+    pub_key_cred_params = req[4]
+
+    if not any(p.get('alg') == -7 for p in pub_key_cred_params):
+        return bytes([CTAP_ERR_INVALID_COMMAND])
+
+    rp_id       = rp['id']
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    pub_nums    = private_key.public_key().public_numbers()
+    cred_id     = secrets.token_bytes(32)
+
+    credential_store.setdefault(rp_id, []).append({
+        'credentialId': cred_id,
+        'privateKey':   private_key,
+        'user':         user,
+        'signCount':    0,
+    })
+
+    cose_key = dumps({
+        1: 2, 3: -7, -1: 1,
+        -2: pub_nums.x.to_bytes(32, 'big'),
+        -3: pub_nums.y.to_bytes(32, 'big'),
+    })
+    attested_cred_data = AAGUID + struct.pack('>H', len(cred_id)) + cred_id + cose_key
+
+    flags     = 0x01 | 0x40  # UP | AT
+    auth_data = _build_auth_data(rp_id, flags, 0, attested_cred_data)
+
+    response = {1: 'none', 2: auth_data, 3: {}}
+    return bytes([CTAP_STATUS_OK]) + dumps(response)
+
+
+def handle_get_assertion(request_cbor):
+    req = loads(request_cbor)
+    print(f"  GetAssertion: {req}")
+
+    rp_id            = req[1]
+    client_data_hash = req[2]
+    allow_list       = req.get(3) or []
+
+    creds = credential_store.get(rp_id, [])
+    if allow_list:
+        allowed_ids = {bytes(d['id']) for d in allow_list}
+        creds = [c for c in creds if c['credentialId'] in allowed_ids]
+    if not creds:
+        return bytes([CTAP_ERR_NO_CREDENTIALS])
+
+    cred = creds[0]
+    cred['signCount'] += 1
+
+    auth_data = _build_auth_data(rp_id, 0x01, cred['signCount'])  # UP
+    signature = cred['privateKey'].sign(auth_data + client_data_hash, ec.ECDSA(hashes.SHA256()))
+
+    response = {
+        1: {'type': 'public-key', 'id': cred['credentialId']},
+        2: auth_data,
+        3: signature,
+        4: cred['user'],
+    }
+    return bytes([CTAP_STATUS_OK]) + dumps(response)
 
 
 def dispatch_ctap(request: bytes) -> bytes:
-    """Dispatch a raw CTAP request byte string; return raw CTAP response."""
     if not request:
         return bytes([CTAP_ERR_INVALID_COMMAND])
-    cmd = request[0]
+    cmd  = request[0]
     body = request[1:]
     if cmd == CTAP_GET_INFO:
         return handle_get_info()
