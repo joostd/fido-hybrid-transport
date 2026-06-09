@@ -261,7 +261,7 @@ def handle_get_info():
         5: 1024,
         9: ['hybrid'],
     }
-    return bytes([CTAP_STATUS_OK]) + dumps(info)
+    return bytes([CTAP_STATUS_OK]) + dumps(info, canonical=True)
 
 
 def handle_make_credential(request_cbor):
@@ -293,14 +293,14 @@ def handle_make_credential(request_cbor):
         1: 2, 3: -7, -1: 1,
         -2: pub_nums.x.to_bytes(32, 'big'),
         -3: pub_nums.y.to_bytes(32, 'big'),
-    })
+    }, canonical=True)
     attested_cred_data = AAGUID + struct.pack('>H', len(cred_id)) + cred_id + cose_key
 
     flags     = 0x01 | 0x40  # UP | AT
     auth_data = _build_auth_data(rp_id, flags, 0, attested_cred_data)
 
     response = {1: 'none', 2: auth_data, 3: {}}
-    return bytes([CTAP_STATUS_OK]) + dumps(response)
+    return bytes([CTAP_STATUS_OK]) + dumps(response, canonical=True)
 
 
 def handle_get_assertion(request_cbor):
@@ -331,7 +331,7 @@ def handle_get_assertion(request_cbor):
         3: signature,
         4: cred['user'],
     }
-    return bytes([CTAP_STATUS_OK]) + dumps(response)
+    return bytes([CTAP_STATUS_OK]) + dumps(response, canonical=True)
 
 
 def dispatch_ctap(request: bytes) -> bytes:
@@ -395,7 +395,7 @@ async def handler(websocket):
     # info_response is b'\x00' + cbor(info_map); strip the status byte --
     # the embedded bytes are just the raw cbor(info_map).
     info_cbor = info_response[1:]
-    post_handshake = dumps({1: info_cbor})
+    post_handshake = dumps({1: info_cbor}, canonical=True)
     await websocket.send(_channel_encrypt(send_cipher, post_handshake))
     print("Sent post-handshake cached getInfo.")
 
