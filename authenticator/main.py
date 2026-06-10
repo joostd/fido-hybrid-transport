@@ -45,6 +45,8 @@ from cable_noise import (
 from fido2.hid import CtapHidDevice, CTAPHID
 from fido2.ctap import CtapError
 
+from ctap_usb import select_usb_device
+
 ### FIDO URIs ###
 
 # Chunk-width table matching the client's base10 encoder (CTAP 2.3 §11.5).
@@ -372,21 +374,25 @@ def handle_selection():
 # CTAP traffic to this device instead of using the software handlers above.
 usb_device = None
 
+# Set during startup if --remote-usb is passed; when set, _dispatch_ctap_async
+# relays CTAP requests to a remote `client/main.py usb-relay` over a second
+# WebSocket connection, which forwards them to a USB security key.
+remote_usb_relay = None
+relay_connected_event = threading.Event()
+relay_token = None
 
-def _select_usb_device():
-    devices = list(CtapHidDevice.list_devices())
-    if not devices:
-        print("No USB CTAP device found.")
-        sys.exit(1)
-    if len(devices) > 1:
-        print(f"Found {len(devices)} USB CTAP devices, using the first:")
-        for d in devices:
-            print(f"  {d}")
-    for extra in devices[1:]:
-        extra.close()
-    device = devices[0]
-    print(f"Relaying CTAP messages to USB device: {device}")
-    return device
+
+class RemoteUsbRelay:
+    """Forwards CTAP request/response bytes to a connected usb-relay client."""
+
+    def __init__(self, websocket):
+        self.websocket = websocket
+        self._lock = asyncio.Lock()
+
+    async def call(self, request: bytes) -> bytes:
+        async with self._lock:
+            await self.websocket.send(request)
+            return await self.websocket.recv()
 
 
 def _log_ctap_message(direction: str, data: bytes, names: dict) -> None:
@@ -447,6 +453,15 @@ async def _dispatch_ctap_async(payload: bytes) -> bytes:
     if usb_device is not None:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, dispatch_ctap, payload)
+    if remote_usb_relay is not None:
+        try:
+            return await remote_usb_relay.call(payload)
+        except Exception as exc:
+            print(f"  Remote USB relay error: {exc}")
+            return bytes([CTAP_ERR_NOT_ALLOWED])
+    if args.remote_usb:
+        print("  No USB relay client connected.")
+        return bytes([CTAP_ERR_NOT_ALLOWED])
     return dispatch_ctap(payload)
 
 
@@ -535,12 +550,36 @@ async def handler(websocket):
     mainloop.quit()
 
 
+async def usb_relay_handler(websocket):
+    global remote_usb_relay
+    print(f"USB relay client connected from {websocket.remote_address}")
+    remote_usb_relay = RemoteUsbRelay(websocket)
+    relay_connected_event.set()
+    try:
+        await websocket.wait_closed()
+    finally:
+        remote_usb_relay = None
+        print("USB relay client disconnected.")
+
+
+async def connection_handler(websocket):
+    path = websocket.request.path
+    if path.startswith("/usb-relay/"):
+        token = path.removeprefix("/usb-relay/")
+        if not secrets.compare_digest(token, relay_token):
+            await websocket.close(1008, "invalid token")
+            return
+        await usb_relay_handler(websocket)
+    else:
+        await handler(websocket)
+
+
 async def main():
     ssl_cert = "fullchain.pem"
     ssl_key  = "privkey.pem"
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain(ssl_cert, keyfile=ssl_key)
-    server = await serve(handler, host="0.0.0.0", port=443,
+    server = await serve(connection_handler, host="0.0.0.0", port=443,
                          subprotocols=["fido.cable"], ssl=ssl_context)
     await server.wait_closed()
 
@@ -562,12 +601,23 @@ arg_parser = argparse.ArgumentParser(description="FIDO CDA Authenticator using C
 arg_parser.add_argument('fido_uri', metavar='FIDO-URI', help="FIDO:/... URI decoded from the QR code")
 arg_parser.add_argument('--usb', action='store_true',
                         help="Relay CTAP messages to a USB security key instead of the built-in software authenticator")
+arg_parser.add_argument('--remote-usb', action='store_true',
+                        help="Relay CTAP messages to a USB security key plugged into a remote machine "
+                             "running `client/main.py usb-relay`")
+arg_parser.add_argument('--relay-token',
+                        help="Secret token for the /usb-relay/<token> path (default: randomly generated)")
 args = arg_parser.parse_args()
+
+if args.usb and args.remote_usb:
+    arg_parser.error("--usb and --remote-usb are mutually exclusive")
 
 fido_uri = args.fido_uri
 
 if args.usb:
-    usb_device = _select_usb_device()
+    usb_device = select_usb_device()
+
+if args.remote_usb:
+    relay_token = args.relay_token or secrets.token_urlsafe(24)
 
 decoded = fido_decode(fido_uri)
 print(f"Decoded FIDO URI: {decoded}")
@@ -620,6 +670,12 @@ print(f"PSK: {psk.hex()}")
 
 # Start WebSocket tunnel server in a background thread.
 threading.Thread(target=run_asyncio, daemon=True).start()
+
+if args.remote_usb:
+    relay_url = f"wss://cable.pyzci7hxyjsvc.org/usb-relay/{relay_token}"
+    print("Waiting for USB relay client to connect:")
+    print(f"  python client/main.py usb-relay --server {relay_url}")
+    relay_connected_event.wait()
 
 ### BLE advertising ###
 

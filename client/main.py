@@ -22,13 +22,18 @@ from websockets.sync.client import connect
 from websockets.exceptions import ConnectionClosedOK
 import websockets
 
+from fido2.hid import CtapHidDevice, CTAPHID
+from fido2.ctap import CtapError
+
 from cable_noise import NoiseHandshake, KeyPair, PATTERN_KN_PSK0, pad_message, unpad_message
+from ctap_usb import select_usb_device
 
 _parser = argparse.ArgumentParser(description="FIDO caBLE client")
 _parser.add_argument('command', nargs='?',
-                     choices=['get-info', 'make-credential', 'get-assertion'],
+                     choices=['get-info', 'make-credential', 'get-assertion', 'usb-relay'],
                      default='get-info')
 _parser.add_argument('--rp-id', default='example.com')
+_parser.add_argument('--server', help="wss://.../usb-relay/<token> URL (for usb-relay)")
 args = _parser.parse_args()
 
 def fido_encode(data):
@@ -119,6 +124,23 @@ async def ping(uri):
         print(f"Latency: {latency}")
 
 if __name__ == "__main__":
+    if args.command == 'usb-relay':
+        usb_device = select_usb_device()
+        with connect(args.server, subprotocols=["fido.cable"]) as websocket:
+            print(f"Connected to relay: {args.server}")
+            for request in websocket:
+                print(f"Relay request ({len(request)} bytes): {request.hex()}")
+                try:
+                    response = usb_device.call(CTAPHID.CBOR, request)
+                except CtapError as exc:
+                    response = bytes([exc.code])
+                except OSError as exc:
+                    print(f"USB device I/O error: {exc}")
+                    break
+                print(f"Relay response ({len(response)} bytes): {response.hex()}")
+                websocket.send(response)
+        sys.exit(0)
+
     eidKey = derive(secret=qrSecret, purpose=keyPurposeEIDKey)
     print(f"Key: { eidKey.hex() }")
 
