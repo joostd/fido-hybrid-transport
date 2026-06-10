@@ -36,6 +36,23 @@ _parser.add_argument('--rp-id', default='example.com')
 _parser.add_argument('--server', help="wss://.../usb-relay/<token> URL (for usb-relay)")
 args = _parser.parse_args()
 
+if args.command == 'usb-relay':
+    usb_device = select_usb_device()
+    with connect(args.server, subprotocols=["fido.cable"]) as websocket:
+        print(f"Connected to relay: {args.server}")
+        for request in websocket:
+            print(f"Relay request ({len(request)} bytes): {request.hex()}")
+            try:
+                response = usb_device.call(CTAPHID.CBOR, request)
+            except CtapError as exc:
+                response = bytes([exc.code])
+            except OSError as exc:
+                print(f"USB device I/O error: {exc}")
+                break
+            print(f"Relay response ({len(response)} bytes): {response.hex()}")
+            websocket.send(response)
+    sys.exit(0)
+
 def fido_encode(data):
   # CBOR-encode input dict
   cbor_data = dumps(data)
@@ -124,23 +141,6 @@ async def ping(uri):
         print(f"Latency: {latency}")
 
 if __name__ == "__main__":
-    if args.command == 'usb-relay':
-        usb_device = select_usb_device()
-        with connect(args.server, subprotocols=["fido.cable"]) as websocket:
-            print(f"Connected to relay: {args.server}")
-            for request in websocket:
-                print(f"Relay request ({len(request)} bytes): {request.hex()}")
-                try:
-                    response = usb_device.call(CTAPHID.CBOR, request)
-                except CtapError as exc:
-                    response = bytes([exc.code])
-                except OSError as exc:
-                    print(f"USB device I/O error: {exc}")
-                    break
-                print(f"Relay response ({len(response)} bytes): {response.hex()}")
-                websocket.send(response)
-        sys.exit(0)
-
     eidKey = derive(secret=qrSecret, purpose=keyPurposeEIDKey)
     print(f"Key: { eidKey.hex() }")
 
