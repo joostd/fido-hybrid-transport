@@ -22,7 +22,7 @@ from websockets.sync.client import connect
 from websockets.exceptions import ConnectionClosedOK
 import websockets
 
-from fido2.hid import CtapHidDevice, CTAPHID
+from fido2.hid import CtapHidDevice, CTAPHID, ConnectionFailure
 from fido2.ctap import CtapError
 
 from cable_noise import NoiseHandshake, KeyPair, PATTERN_KN_PSK0, pad_message, unpad_message
@@ -36,21 +36,38 @@ _parser.add_argument('--rp-id', default='example.com')
 _parser.add_argument('--server', help="wss://.../usb-relay/<token> URL (for usb-relay)")
 args = _parser.parse_args()
 
+def _call_usb_device(usb_device, request):
+    # ConnectionFailure("Wrong channel") is a transient hiccup seen on macOS,
+    # where another process (e.g. ctkd) also polling the security key over
+    # USB HID can cause one of its response packets to be delivered to us.
+    # The request is safe to retry -- just try again.
+    for attempt in range(3):
+        try:
+            return usb_device.call(CTAPHID.CBOR, request)
+        except CtapError as exc:
+            return bytes([exc.code])
+        except ConnectionFailure as exc:
+            print(f"  USB device connection failure: {exc} (attempt {attempt + 1}/3)")
+            time.sleep(0.1)
+    return bytes([0x30])  # CTAP2_ERR_NOT_ALLOWED -- gave up after retries
+
+
 if args.command == 'usb-relay':
     usb_device = select_usb_device()
     with connect(args.server, subprotocols=["fido.cable"]) as websocket:
         print(f"Connected to relay: {args.server}")
-        for request in websocket:
-            print(f"Relay request ({len(request)} bytes): {request.hex()}")
-            try:
-                response = usb_device.call(CTAPHID.CBOR, request)
-            except CtapError as exc:
-                response = bytes([exc.code])
-            except OSError as exc:
-                print(f"USB device I/O error: {exc}")
-                break
-            print(f"Relay response ({len(response)} bytes): {response.hex()}")
-            websocket.send(response)
+        try:
+            for request in websocket:
+                print(f"Relay request ({len(request)} bytes): {request.hex()}")
+                try:
+                    response = _call_usb_device(usb_device, request)
+                except OSError as exc:
+                    print(f"USB device I/O error: {exc}")
+                    break
+                print(f"Relay response ({len(response)} bytes): {response.hex()}")
+                websocket.send(response)
+        except websockets.exceptions.ConnectionClosed as exc:
+            print(f"Relay connection closed: {exc}")
     sys.exit(0)
 
 def fido_encode(data):
