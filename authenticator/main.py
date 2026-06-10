@@ -185,6 +185,7 @@ def start_advertising():
 CTAP_GET_INFO                = 0x04
 CTAP_GET_ASSERTION           = 0x02
 CTAP_MAKE_CREDENTIAL         = 0x01
+CTAP_SELECTION               = 0x0B
 CTAP_STATUS_OK               = 0x00
 CTAP_ERR_INVALID_COMMAND     = 0x01
 CTAP_ERR_CREDENTIAL_EXCLUDED = 0x19
@@ -197,6 +198,7 @@ CTAP_COMMAND_NAMES = {
     CTAP_MAKE_CREDENTIAL: "authenticatorMakeCredential",
     CTAP_GET_ASSERTION:   "authenticatorGetAssertion",
     CTAP_GET_INFO:        "authenticatorGetInfo",
+    CTAP_SELECTION:       "authenticatorSelection",
 }
 
 CTAP_STATUS_NAMES = {
@@ -276,7 +278,12 @@ def handle_get_info():
         1: ['FIDO_2_0', 'FIDO_2_1'],
         2: [],
         3: AAGUID,
-        4: {'rk': True, 'up': True, 'uv': False},
+        # uv: true -- per the hybrid/caBLE convention, user verification is
+        # performed "outside" CTAP (the user already unlocked this device to
+        # establish the connection), so platforms expect uv: true without a
+        # pinUvAuthProtocol/clientPin. Without it, Chrome skips getAssertion
+        # for requests with userVerification: required.
+        4: {'rk': True, 'up': True, 'uv': True},
         5: 1024,
         9: ['hybrid'],
     }
@@ -320,7 +327,7 @@ def handle_make_credential(request_cbor):
     }, canonical=True)
     attested_cred_data = AAGUID + struct.pack('>H', len(cred_id)) + cred_id + cose_key
 
-    flags     = 0x01 | 0x40  # UP | AT
+    flags     = 0x01 | 0x04 | 0x40  # UP | UV | AT
     auth_data = _build_auth_data(rp_id, flags, 0, attested_cred_data)
 
     response = {1: 'none', 2: auth_data, 3: {}}
@@ -345,7 +352,7 @@ def handle_get_assertion(request_cbor):
     cred['signCount'] += 1
     _save_credential_store()
 
-    auth_data = _build_auth_data(rp_id, 0x01, cred['signCount'])  # UP
+    auth_data = _build_auth_data(rp_id, 0x01 | 0x04, cred['signCount'])  # UP | UV
     signature = cred['privateKey'].sign(auth_data + client_data_hash, ec.ECDSA(hashes.SHA256()))
 
     response = {
@@ -355,6 +362,10 @@ def handle_get_assertion(request_cbor):
         4: cred['user'],
     }
     return bytes([CTAP_STATUS_OK]) + dumps(response, canonical=True)
+
+
+def handle_selection():
+    return bytes([CTAP_STATUS_OK])
 
 
 # Set during startup if --usb is passed; when set, dispatch_ctap relays all
@@ -414,6 +425,8 @@ def dispatch_ctap(request: bytes) -> bytes:
         return handle_get_assertion(body)
     if cmd == CTAP_MAKE_CREDENTIAL:
         return handle_make_credential(body)
+    if cmd == CTAP_SELECTION:
+        return handle_selection()
     print(f"  Unknown CTAP command 0x{cmd:02x}")
     return bytes([CTAP_ERR_INVALID_COMMAND])
 
@@ -517,7 +530,6 @@ async def handler(websocket):
 
         response_frame = bytes([CTAP_FRAME_CTAP]) + ctap_response
         await websocket.send(_channel_encrypt(send_cipher, response_frame))
-        break
 
     print("Session complete -- exiting.")
     mainloop.quit()
