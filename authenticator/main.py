@@ -192,6 +192,19 @@ CTAP_ERR_NOT_ALLOWED     = 0x30
 CTAP_FRAME_CTAP          = 0x01
 CTAP_FRAME_SHUTDOWN      = 0x00
 
+CTAP_COMMAND_NAMES = {
+    CTAP_MAKE_CREDENTIAL: "authenticatorMakeCredential",
+    CTAP_GET_ASSERTION:   "authenticatorGetAssertion",
+    CTAP_GET_INFO:        "authenticatorGetInfo",
+}
+
+CTAP_STATUS_NAMES = {
+    CTAP_STATUS_OK:           "CTAP2_OK",
+    CTAP_ERR_INVALID_COMMAND: "CTAP1_ERR_INVALID_COMMAND",
+    CTAP_ERR_NO_CREDENTIALS:  "CTAP2_ERR_NO_CREDENTIALS",
+    CTAP_ERR_NOT_ALLOWED:     "CTAP2_ERR_NOT_ALLOWED",
+}
+
 AAGUID = bytes.fromhex('aaf6ecbd9da0e23f57350e03e6667ea1')
 
 CREDENTIAL_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'credentials.json')
@@ -270,7 +283,6 @@ def handle_get_info():
 
 def handle_make_credential(request_cbor):
     req = loads(request_cbor)
-    print(f"  MakeCredential: {req}")
 
     client_data_hash    = req[1]
     rp                  = req[2]
@@ -309,7 +321,6 @@ def handle_make_credential(request_cbor):
 
 def handle_get_assertion(request_cbor):
     req = loads(request_cbor)
-    print(f"  GetAssertion: {req}")
 
     rp_id            = req[1]
     client_data_hash = req[2]
@@ -357,6 +368,21 @@ def _select_usb_device():
     device = devices[0]
     print(f"Relaying CTAP messages to USB device: {device}")
     return device
+
+
+def _log_ctap_message(direction: str, data: bytes, names: dict) -> None:
+    """Log a raw CTAP request/response: hex bytes plus decoded CBOR body."""
+    if not data:
+        print(f"CTAP {direction}: (empty)")
+        return
+    code = data[0]
+    name = names.get(code, f"0x{code:02x}")
+    print(f"CTAP {direction}: {name} ({len(data)} bytes): {data.hex()}")
+    if len(data) > 1:
+        try:
+            print(f"  decoded: {loads(data[1:])!r}")
+        except Exception as exc:
+            print(f"  decoded: <CBOR decode failed: {exc}>")
 
 
 def dispatch_ctap(request: bytes) -> bytes:
@@ -435,7 +461,10 @@ async def handler(websocket):
     # response as a bare CBOR wrapper map {1: cbor_encoded_info_bytes}.
     # The client reads this BEFORE sending any CTAP requests (CTAP 2.3
     # sctn-hybrid "readPostHandshakeMessage"); it does NOT have a type byte.
-    info_response = await _dispatch_ctap_async(bytes([CTAP_GET_INFO]))
+    info_request = bytes([CTAP_GET_INFO])
+    _log_ctap_message("request", info_request, CTAP_COMMAND_NAMES)
+    info_response = await _dispatch_ctap_async(info_request)
+    _log_ctap_message("response", info_response, CTAP_STATUS_NAMES)
     # info_response is status_byte + cbor(info_map); strip the status byte --
     # the embedded bytes are just the raw cbor(info_map).
     info_cbor = info_response[1:]
@@ -474,9 +503,9 @@ async def handler(websocket):
             print(f"Unexpected frame type 0x{frame_type:02x} -- ignoring")
             continue
 
-        print(f"CTAP request ({len(payload)} bytes): cmd=0x{payload[0]:02x}" if payload else "CTAP request (empty)")
+        _log_ctap_message("request", payload, CTAP_COMMAND_NAMES)
         ctap_response = await _dispatch_ctap_async(payload)
-        print(f"CTAP response ({len(ctap_response)} bytes): status=0x{ctap_response[0]:02x}")
+        _log_ctap_message("response", ctap_response, CTAP_STATUS_NAMES)
 
         response_frame = bytes([CTAP_FRAME_CTAP]) + ctap_response
         await websocket.send(_channel_encrypt(send_cipher, response_frame))
