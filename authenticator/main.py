@@ -6,6 +6,7 @@
 import sys
 import os
 import json
+import argparse
 import datetime
 import asyncio
 import threading
@@ -40,6 +41,9 @@ from cable_noise import (
     pad_message, unpad_message,
     PATTERN_KN_PSK0,
 )
+
+from fido2.hid import CtapHidDevice, CTAPHID
+from fido2.ctap import CtapError
 
 ### FIDO URIs ###
 
@@ -334,7 +338,38 @@ def handle_get_assertion(request_cbor):
     return bytes([CTAP_STATUS_OK]) + dumps(response, canonical=True)
 
 
+# Set during startup if --usb is passed; when set, dispatch_ctap relays all
+# CTAP traffic to this device instead of using the software handlers above.
+usb_device = None
+
+
+def _select_usb_device():
+    devices = list(CtapHidDevice.list_devices())
+    if not devices:
+        print("No USB CTAP device found.")
+        sys.exit(1)
+    if len(devices) > 1:
+        print(f"Found {len(devices)} USB CTAP devices, using the first:")
+        for d in devices:
+            print(f"  {d}")
+    for extra in devices[1:]:
+        extra.close()
+    device = devices[0]
+    print(f"Relaying CTAP messages to USB device: {device}")
+    return device
+
+
 def dispatch_ctap(request: bytes) -> bytes:
+    if usb_device is not None:
+        try:
+            return usb_device.call(CTAPHID.CBOR, request)
+        except CtapError as exc:
+            print(f"  USB device error: {exc}")
+            return bytes([exc.code])
+        except OSError as exc:
+            print(f"  USB device I/O error: {exc}")
+            return bytes([CTAP_ERR_NOT_ALLOWED])
+
     if not request:
         return bytes([CTAP_ERR_INVALID_COMMAND])
     cmd  = request[0]
@@ -357,6 +392,15 @@ def _channel_encrypt(cipher, plaintext: bytes) -> bytes:
 
 def _channel_decrypt(cipher, ciphertext: bytes) -> bytes:
     return unpad_message(cipher.decrypt_with_ad(b"", ciphertext))
+
+
+async def _dispatch_ctap_async(payload: bytes) -> bytes:
+    """Run dispatch_ctap off the event loop when relaying to a USB device,
+    since usb_device.call() blocks until the user touches the key."""
+    if usb_device is not None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, dispatch_ctap, payload)
+    return dispatch_ctap(payload)
 
 
 async def handler(websocket):
@@ -391,8 +435,8 @@ async def handler(websocket):
     # response as a bare CBOR wrapper map {1: cbor_encoded_info_bytes}.
     # The client reads this BEFORE sending any CTAP requests (CTAP 2.3
     # sctn-hybrid "readPostHandshakeMessage"); it does NOT have a type byte.
-    info_response = handle_get_info()
-    # info_response is b'\x00' + cbor(info_map); strip the status byte --
+    info_response = await _dispatch_ctap_async(bytes([CTAP_GET_INFO]))
+    # info_response is status_byte + cbor(info_map); strip the status byte --
     # the embedded bytes are just the raw cbor(info_map).
     info_cbor = info_response[1:]
     post_handshake = dumps({1: info_cbor}, canonical=True)
@@ -431,7 +475,7 @@ async def handler(websocket):
             continue
 
         print(f"CTAP request ({len(payload)} bytes): cmd=0x{payload[0]:02x}" if payload else "CTAP request (empty)")
-        ctap_response = dispatch_ctap(payload)
+        ctap_response = await _dispatch_ctap_async(payload)
         print(f"CTAP response ({len(ctap_response)} bytes): status=0x{ctap_response[0]:02x}")
 
         response_frame = bytes([CTAP_FRAME_CTAP]) + ctap_response
@@ -465,11 +509,16 @@ if os.getuid() != 0:
     print("Need root!")
     sys.exit(1)
 
-if len(sys.argv) < 2:
-    print("Usage: main.py <FIDO-URI>")
-    sys.exit(1)
+arg_parser = argparse.ArgumentParser(description="FIDO CDA Authenticator using CTAP hybrid transport")
+arg_parser.add_argument('fido_uri', metavar='FIDO-URI', help="FIDO:/... URI decoded from the QR code")
+arg_parser.add_argument('--usb', action='store_true',
+                        help="Relay CTAP messages to a USB security key instead of the built-in software authenticator")
+args = arg_parser.parse_args()
 
-fido_uri = sys.argv[1]
+fido_uri = args.fido_uri
+
+if args.usb:
+    usb_device = _select_usb_device()
 
 decoded = fido_decode(fido_uri)
 print(f"Decoded FIDO URI: {decoded}")
