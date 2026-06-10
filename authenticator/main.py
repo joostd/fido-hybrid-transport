@@ -182,15 +182,16 @@ def start_advertising():
 
 ### CTAP command handlers ###
 
-CTAP_GET_INFO        = 0x04
-CTAP_GET_ASSERTION   = 0x02
-CTAP_MAKE_CREDENTIAL = 0x01
-CTAP_STATUS_OK       = 0x00
-CTAP_ERR_INVALID_COMMAND = 0x01
-CTAP_ERR_NO_CREDENTIALS  = 0x2E
-CTAP_ERR_NOT_ALLOWED     = 0x30
-CTAP_FRAME_CTAP          = 0x01
-CTAP_FRAME_SHUTDOWN      = 0x00
+CTAP_GET_INFO                = 0x04
+CTAP_GET_ASSERTION           = 0x02
+CTAP_MAKE_CREDENTIAL         = 0x01
+CTAP_STATUS_OK               = 0x00
+CTAP_ERR_INVALID_COMMAND     = 0x01
+CTAP_ERR_CREDENTIAL_EXCLUDED = 0x19
+CTAP_ERR_NO_CREDENTIALS      = 0x2E
+CTAP_ERR_NOT_ALLOWED         = 0x30
+CTAP_FRAME_CTAP              = 0x01
+CTAP_FRAME_SHUTDOWN          = 0x00
 
 CTAP_COMMAND_NAMES = {
     CTAP_MAKE_CREDENTIAL: "authenticatorMakeCredential",
@@ -199,10 +200,11 @@ CTAP_COMMAND_NAMES = {
 }
 
 CTAP_STATUS_NAMES = {
-    CTAP_STATUS_OK:           "CTAP2_OK",
-    CTAP_ERR_INVALID_COMMAND: "CTAP1_ERR_INVALID_COMMAND",
-    CTAP_ERR_NO_CREDENTIALS:  "CTAP2_ERR_NO_CREDENTIALS",
-    CTAP_ERR_NOT_ALLOWED:     "CTAP2_ERR_NOT_ALLOWED",
+    CTAP_STATUS_OK:               "CTAP2_OK",
+    CTAP_ERR_INVALID_COMMAND:     "CTAP1_ERR_INVALID_COMMAND",
+    CTAP_ERR_CREDENTIAL_EXCLUDED: "CTAP2_ERR_CREDENTIAL_EXCLUDED",
+    CTAP_ERR_NO_CREDENTIALS:      "CTAP2_ERR_NO_CREDENTIALS",
+    CTAP_ERR_NOT_ALLOWED:         "CTAP2_ERR_NOT_ALLOWED",
 }
 
 AAGUID = bytes.fromhex('aaf6ecbd9da0e23f57350e03e6667ea1')
@@ -274,7 +276,7 @@ def handle_get_info():
         1: ['FIDO_2_0', 'FIDO_2_1'],
         2: [],
         3: AAGUID,
-        4: {'rk': False, 'up': True, 'uv': False},
+        4: {'rk': True, 'up': True, 'uv': False},
         5: 1024,
         9: ['hybrid'],
     }
@@ -288,11 +290,17 @@ def handle_make_credential(request_cbor):
     rp                  = req[2]
     user                = req[3]
     pub_key_cred_params = req[4]
+    exclude_list        = req.get(5) or []
 
     if not any(p.get('alg') == -7 for p in pub_key_cred_params):
         return bytes([CTAP_ERR_INVALID_COMMAND])
 
-    rp_id       = rp['id']
+    rp_id = rp['id']
+
+    excluded_ids = {bytes(d['id']) for d in exclude_list}
+    if any(c['credentialId'] in excluded_ids for c in credential_store.get(rp_id, [])):
+        return bytes([CTAP_ERR_CREDENTIAL_EXCLUDED])
+
     private_key = ec.generate_private_key(ec.SECP256R1())
     pub_nums    = private_key.public_key().public_numbers()
     cred_id     = secrets.token_bytes(32)
