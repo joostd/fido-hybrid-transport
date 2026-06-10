@@ -3,11 +3,13 @@
 import pyqrcode
 
 import os
+import sys
 import time
 import asyncio
 import hmac
 import hashlib
 import secrets
+import argparse
 from bleak import BleakScanner
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -21,6 +23,13 @@ from websockets.exceptions import ConnectionClosedOK
 import websockets
 
 from cable_noise import NoiseHandshake, KeyPair, PATTERN_KN_PSK0, pad_message, unpad_message
+
+_parser = argparse.ArgumentParser(description="FIDO caBLE client")
+_parser.add_argument('command', nargs='?',
+                     choices=['get-info', 'make-credential', 'get-assertion'],
+                     default='get-info')
+_parser.add_argument('--rp-id', default='example.com')
+args = _parser.parse_args()
 
 def fido_encode(data):
   # CBOR-encode input dict
@@ -51,7 +60,7 @@ authenticatorData = {
   2: len(assignedTunnelServerDomains),
   3: timestamp,
   4: False,
-  5: 'ga'
+  5: 'mc' if args.command == 'make-credential' else 'ga'
 }
 fido = fido_encode(authenticatorData)
 
@@ -188,16 +197,50 @@ if __name__ == "__main__":
             post_hs = loads(unpad_message(receive_cipher.decrypt_with_ad(b"", raw)))
             print(f"Post-handshake cached getInfo: {post_hs}")
 
-            # CTAP getInfo: frame_type=0x01 (CTAP_FRAME_CTAP) + cmd=0x04 (CTAP_GET_INFO).
-            ctap_frame = bytes([0x01, 0x04])
-            websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
-            print("Sent CTAP getInfo.")
+            CTAP_FRAME_CTAP = 0x01
 
-            raw = websocket.recv(timeout=10)
-            resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
-            status = resp[1]
-            info = loads(resp[2:])
-            print(f"CTAP getInfo response: status=0x{status:02x}, info={info}")
+            if args.command == 'get-info':
+                ctap_frame = bytes([CTAP_FRAME_CTAP, 0x04])
+                websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
+                print("Sent CTAP getInfo.")
+                raw = websocket.recv(timeout=10)
+                resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+                status = resp[1]
+                print(f"CTAP getInfo response: status=0x{status:02x}, info={loads(resp[2:])}")
+
+            elif args.command == 'make-credential':
+                client_data_hash = secrets.token_bytes(32)
+                mc_req = dumps({
+                    1: client_data_hash,
+                    2: {'id': args.rp_id, 'name': args.rp_id},
+                    3: {'id': b'user01', 'name': 'Test User'},
+                    4: [{'type': 'public-key', 'alg': -7}],
+                }, canonical=True)
+                ctap_frame = bytes([CTAP_FRAME_CTAP, 0x01]) + mc_req
+                websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
+                print(f"Sent CTAP makeCredential (rp={args.rp_id}).")
+                raw = websocket.recv(timeout=10)
+                resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+                status = resp[1]
+                print(f"CTAP makeCredential response: status=0x{status:02x}")
+                if status == 0x00:
+                    print(f"  response map: {loads(resp[2:])}")
+
+            elif args.command == 'get-assertion':
+                client_data_hash = secrets.token_bytes(32)
+                ga_req = dumps({
+                    1: args.rp_id,
+                    2: client_data_hash,
+                }, canonical=True)
+                ctap_frame = bytes([CTAP_FRAME_CTAP, 0x02]) + ga_req
+                websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
+                print(f"Sent CTAP getAssertion (rp={args.rp_id}).")
+                raw = websocket.recv(timeout=10)
+                resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+                status = resp[1]
+                print(f"CTAP getAssertion response: status=0x{status:02x}")
+                if status == 0x00:
+                    print(f"  response map: {loads(resp[2:])}")
 
         except websockets.exceptions.ConnectionClosedOK as e:
             print(f"Connection closed OK: {e}")
