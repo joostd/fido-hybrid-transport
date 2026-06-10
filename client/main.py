@@ -14,11 +14,13 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.backends import default_backend
-from cbor2 import dumps
+from cbor2 import dumps, loads
 
 from websockets.sync.client import connect
 from websockets.exceptions import ConnectionClosedOK
 import websockets
+
+from cable_noise import NoiseHandshake, KeyPair, PATTERN_KN_PSK0, pad_message, unpad_message
 
 def fido_encode(data):
   # CBOR-encode input dict
@@ -150,19 +152,55 @@ if __name__ == "__main__":
     print(connectURL)
 
     with connect(connectURL, subprotocols=["fido.cable"]) as websocket:
-      try:
-        print(f"connected to { connectURL }")
-        psk = derive(secret=qrSecret, salt=cableData, purpose=keyPurposePSK)
-        print(f"PSK: { psk.hex() }")
-        # todo: use psk te encrypt nil message using noise state
-        todo = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
-        msg1 = pubKeyUncompressed + todo
-        print(f"Sending initiator handshake request message: { msg1.hex() }")
-        websocket.send(msg1) # msg1 is a bytestring so a binary frame will be sent
-        message = websocket.recv(timeout=10) # binary frame - disable UTF8 decoding
-        print(f"Received: {message.hex()}")
-      except websockets.exceptions.ConnectionClosedOK as e:
-        print(f"{e}")
+        try:
+            print(f"connected to {connectURL}")
+
+            # PSK: salt is eid_plaintext (payload), not cableData (encrypted EID).
+            # derive() is hardcoded to length=64; [:32] is safe because
+            # HKDF T(1) is identical whether you request 32 or 64 bytes of output.
+            psk = derive(secret=qrSecret, salt=payload, purpose=keyPurposePSK)[:32]
+            print(f"PSK: {psk.hex()}")
+
+            local_static = KeyPair(private_key=private_key, public_bytes=pubKeyUncompressed)
+
+            hs = NoiseHandshake(
+                pattern=PATTERN_KN_PSK0,
+                role="initiator",
+                local_static=local_static,
+                psk=psk,
+            )
+
+            msg1 = hs.write_message()
+            print(f"Sending msg1 ({len(msg1)} bytes): {msg1.hex()}")
+            websocket.send(msg1)
+
+            msg2 = websocket.recv(timeout=10)
+            print(f"Received msg2 ({len(msg2)} bytes): {msg2.hex()}")
+            hs.read_message(msg2)
+
+            result = hs.finish()
+            send_cipher = result.send_cipher
+            receive_cipher = result.receive_cipher
+            print("Noise handshake complete.")
+
+            # Post-handshake: server sends {1: cbor_info_bytes} immediately after handshake.
+            raw = websocket.recv(timeout=10)
+            post_hs = loads(unpad_message(receive_cipher.decrypt_with_ad(b"", raw)))
+            print(f"Post-handshake cached getInfo: {post_hs}")
+
+            # CTAP getInfo: frame_type=0x01 (CTAP_FRAME_CTAP) + cmd=0x04 (CTAP_GET_INFO).
+            ctap_frame = bytes([0x01, 0x04])
+            websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
+            print("Sent CTAP getInfo.")
+
+            raw = websocket.recv(timeout=10)
+            resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+            status = resp[1]
+            info = loads(resp[2:])
+            print(f"CTAP getInfo response: status=0x{status:02x}, info={info}")
+
+        except websockets.exceptions.ConnectionClosedOK as e:
+            print(f"Connection closed OK: {e}")
 
     #loop = asyncio.new_event_loop()
     #asyncio.set_event_loop(loop)
