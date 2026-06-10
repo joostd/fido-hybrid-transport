@@ -8,6 +8,7 @@ dependencies = [
     "bleak>=3.0.2",
     "cbor2>=6.1.2",
     "cryptography>=48.0.1",
+    "fido2>=2.2.0",
     "pyqrcode>=1.2.1",
     "websockets>=16.0",
 ]
