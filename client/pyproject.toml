@@ -1,0 +1,13 @@
+[project]
+name = "client"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "bleak>=3.0.2",
+    "cbor2>=6.1.2",
+    "cryptography>=48.0.1",
+    "pyqrcode>=1.2.1",
+    "websockets>=16.0",
+]
