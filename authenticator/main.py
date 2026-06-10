@@ -466,7 +466,7 @@ if os.getuid() != 0:
     sys.exit(1)
 
 if len(sys.argv) < 2:
-    print("Usage: cda-authenticator.py <FIDO-URI>")
+    print("Usage: main.py <FIDO-URI>")
     sys.exit(1)
 
 fido_uri = sys.argv[1]

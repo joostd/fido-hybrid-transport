@@ -22,7 +22,7 @@ ln -s /etc/letsencrypt/live/cable.pyzci7hxyjsvc.org/privkey.pem
 
     sudo -s # must run as root
     source venv/bin/activate
-    python cda-authenticator.py FIDO://... # scan the QR code from a CTAP client and paste the decoded FIDO URL
+    python main.py FIDO://... # scan the QR code from a CTAP client and paste the decoded FIDO URL
 
 Point an existing CTAP 2.3 client at the Pi's WebSocket endpoint;
 confirm the Noise handshake completes and `get-info` returns a valid response
