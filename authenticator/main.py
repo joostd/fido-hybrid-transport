@@ -607,19 +607,30 @@ def _load_ssl_context():
     return ssl_context
 
 
+# --tunnel-server {google,local} -> (registration domain, tunnel_serviceID).
+# tunnel_serviceID 0x0000 is Google (cable.ua5v.com, assignedTunnelServerDomains[0]
+# in client/main.py); 0x0105 is the same custom-domain encoding 'self' uses,
+# which client/main.py already maps to cable.pyzci7hxyjsvc.org.
+TUNNEL_REGISTRARS = {
+    'google': ("cable.ua5v.com", b'\x00\x00'),
+    'local':  ("cable.pyzci7hxyjsvc.org", b'\x05\x01'),
+}
+
+
 async def main():
     try:
-        if args.tunnel_server == 'google':
+        if args.tunnel_server in TUNNEL_REGISTRARS:
+            domain, tunnel_service_id = TUNNEL_REGISTRARS[args.tunnel_server]
             tunnel_id = derive(qrSecret, purpose=keyPurposeTunnelID)[:16]
-            url = f"wss://cable.ua5v.com/cable/new/{tunnel_id.hex()}"
-            print(f"Registering tunnel with Google: {url}")
+            url = f"wss://{domain}/cable/new/{tunnel_id.hex()}"
+            print(f"Registering tunnel with {domain}: {url}")
             async with websockets.connect(
                 url, subprotocols=["fido.cable"],
-                additional_headers={"Origin": "wss://cable.ua5v.com"},
+                additional_headers={"Origin": f"wss://{domain}"},
             ) as websocket:
                 routing_id = bytes.fromhex(websocket.response.headers["X-caBLE-Routing-ID"])
-                print(f"Routing ID from Google: {routing_id.hex()}")
-                _finalize_ble_advert_data(routing_id, b'\x00\x00')
+                print(f"Routing ID from {domain}: {routing_id.hex()}")
+                _finalize_ble_advert_data(routing_id, tunnel_service_id)
 
                 if args.remote_usb:
                     server = await serve(connection_handler, host="0.0.0.0", port=443,
@@ -655,11 +666,13 @@ arg_parser.add_argument('--remote-usb', action='store_true',
                              "running `client/main.py usb-relay`")
 arg_parser.add_argument('--relay-token',
                         help="Secret token for the /usb-relay/<token> path (default: randomly generated)")
-arg_parser.add_argument('--tunnel-server', choices=['self', 'google'], default='google',
+arg_parser.add_argument('--tunnel-server', choices=['self', 'google', 'local'], default='google',
                         help="'google' (default) registers a tunnel with Google's caBLE "
-                             "relay (cable.ua5v.com); 'self' hosts our own WSS tunnel "
-                             "endpoint instead. The 'google' option relies on "
-                             "undocumented infrastructure that could change or break.")
+                             "relay (cable.ua5v.com); 'local' registers with our own "
+                             "tunnel/main.py relay at cable.pyzci7hxyjsvc.org instead; "
+                             "'self' hosts our own WSS tunnel endpoint directly. The "
+                             "'google' option relies on undocumented infrastructure that "
+                             "could change or break.")
 args = arg_parser.parse_args()
 
 if args.usb and args.remote_usb:
