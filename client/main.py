@@ -199,7 +199,8 @@ if __name__ == "__main__":
     connectURL = "wss://" + tunnelServerDomain + "/cable/connect/" + routingID.hex() + "/" + tunnelID.hex() # TODO add TLS
     print(connectURL)
 
-    with connect(connectURL, subprotocols=["fido.cable"]) as websocket:
+    with connect(connectURL, subprotocols=["fido.cable"],
+                  additional_headers={"Origin": f"wss://{tunnelServerDomain}"}) as websocket:
         try:
             print(f"connected to {connectURL}")
 

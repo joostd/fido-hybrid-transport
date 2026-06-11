@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.serialization import (
     Encoding, PrivateFormat, NoEncryption, load_pem_private_key,
 )
 
+import websockets
 from websockets import serve
 
 # BLE
@@ -381,6 +382,16 @@ remote_usb_relay = None
 relay_connected_event = threading.Event()
 relay_token = None
 
+# Set by _finalize_ble_advert_data() once the tunnel server (self-hosted or
+# Google) is set up and routingID is known. The main thread waits on this
+# before building/starting the BLE advertisement.
+ble_data_ready = threading.Event()
+routingID = None
+tunnel_serviceID = None
+eid_plaintext = None
+serviceData = None
+psk = None
+
 
 class RemoteUsbRelay:
     """Forwards CTAP request/response bytes to a connected usb-relay client."""
@@ -574,14 +585,56 @@ async def connection_handler(websocket):
         await handler(websocket)
 
 
-async def main():
-    ssl_cert = "fullchain.pem"
-    ssl_key  = "privkey.pem"
+def _finalize_ble_advert_data(routing_id, tunnel_service_id):
+    """Compute eid_plaintext / serviceData / psk now that routingID and
+    tunnel_serviceID are known, and unblock the main thread, which is
+    waiting to build the BLE advertisement."""
+    global routingID, tunnel_serviceID, eid_plaintext, serviceData, psk
+    routingID = routing_id
+    tunnel_serviceID = tunnel_service_id
+    eid_plaintext = flags + nonce + routingID + tunnel_serviceID
+    print(f"EID plaintext: {eid_plaintext.hex()}")
+    serviceData = encrypt_eid(eidKey, eid_plaintext)
+    print(f"EID encrypted: {serviceData.hex()}")
+    psk = derive(qrSecret, salt=eid_plaintext, purpose=keyPurposePSK, length=32)
+    print(f"PSK: {psk.hex()}")
+    ble_data_ready.set()
+
+
+def _load_ssl_context():
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain(ssl_cert, keyfile=ssl_key)
-    server = await serve(connection_handler, host="0.0.0.0", port=443,
-                         subprotocols=["fido.cable"], ssl=ssl_context)
-    await server.wait_closed()
+    ssl_context.load_cert_chain("fullchain.pem", keyfile="privkey.pem")
+    return ssl_context
+
+
+async def main():
+    try:
+        if args.tunnel_server == 'google':
+            tunnel_id = derive(qrSecret, purpose=keyPurposeTunnelID)[:16]
+            url = f"wss://cable.ua5v.com/cable/new/{tunnel_id.hex()}"
+            print(f"Registering tunnel with Google: {url}")
+            async with websockets.connect(
+                url, subprotocols=["fido.cable"],
+                additional_headers={"Origin": "wss://cable.ua5v.com"},
+            ) as websocket:
+                routing_id = bytes.fromhex(websocket.response.headers["X-caBLE-Routing-ID"])
+                print(f"Routing ID from Google: {routing_id.hex()}")
+                _finalize_ble_advert_data(routing_id, b'\x00\x00')
+
+                if args.remote_usb:
+                    server = await serve(connection_handler, host="0.0.0.0", port=443,
+                                         subprotocols=["fido.cable"], ssl=_load_ssl_context())
+                    await asyncio.gather(handler(websocket), server.wait_closed())
+                else:
+                    await handler(websocket)
+        else:
+            _finalize_ble_advert_data(secrets.token_bytes(3), b'\x05\x01')
+            server = await serve(connection_handler, host="0.0.0.0", port=443,
+                                 subprotocols=["fido.cable"], ssl=_load_ssl_context())
+            await server.wait_closed()
+    except Exception as exc:
+        print(f"Fatal error setting up tunnel server: {exc!r}")
+        os._exit(1)
 
 
 def run_asyncio():
@@ -606,6 +659,11 @@ arg_parser.add_argument('--remote-usb', action='store_true',
                              "running `client/main.py usb-relay`")
 arg_parser.add_argument('--relay-token',
                         help="Secret token for the /usb-relay/<token> path (default: randomly generated)")
+arg_parser.add_argument('--tunnel-server', choices=['self', 'google'], default='google',
+                        help="'google' (default) registers a tunnel with Google's caBLE "
+                             "relay (cable.ua5v.com); 'self' hosts our own WSS tunnel "
+                             "endpoint instead. The 'google' option relies on "
+                             "undocumented infrastructure that could change or break.")
 args = arg_parser.parse_args()
 
 if args.usb and args.remote_usb:
@@ -650,26 +708,21 @@ except KeyError as exc:
 eidKey = derive(qrSecret, purpose=keyPurposeEIDKey)
 print(f"EID key: {eidKey.hex()}")
 
-flags      = b'\x00'
-nonce      = secrets.token_bytes(10)
-routingID  = secrets.token_bytes(3)
-# tunnel_serviceID: 2-byte little-endian domain index.
-# 0x0005 = custom domain (cable.pyzci7hxyjsvc.org) used by this Pi server.
-tunnel_serviceID = b'\x05\x01'
+flags = b'\x00'
+nonce = secrets.token_bytes(10)
+# tunnel_serviceID (2-byte little-endian domain index), routingID, and the
+# resulting eid_plaintext / serviceData / PSK (CTAP 2.3 §11.5
+# "derive(qrSecret, eid, keyPurposePSK)") are computed by main(), in the
+# background thread started below: for --tunnel-server self this is
+# immediate (0x0105 = custom domain cable.pyzci7hxyjsvc.org, random
+# routingID); for --tunnel-server google it happens after registering with
+# Google's relay and learning routingID from its response.
 
-eid_plaintext = flags + nonce + routingID + tunnel_serviceID
-print(f"EID plaintext: {eid_plaintext.hex()}")
-
-serviceData = encrypt_eid(eidKey, eid_plaintext)
-print(f"EID encrypted: {serviceData.hex()}")
-
-# Derive PSK from QR secret salted with the EID plaintext (CTAP 2.3 §11.5
-# "derive(qrSecret, eid, keyPurposePSK)").
-psk = derive(qrSecret, salt=eid_plaintext, purpose=keyPurposePSK, length=32)
-print(f"PSK: {psk.hex()}")
-
-# Start WebSocket tunnel server in a background thread.
+# Start WebSocket tunnel server / Google tunnel registration in a background thread.
 threading.Thread(target=run_asyncio, daemon=True).start()
+
+print("Waiting for tunnel setup...")
+ble_data_ready.wait()
 
 if args.remote_usb:
     relay_url = f"wss://cable.pyzci7hxyjsvc.org/usb-relay/{relay_token}"
