@@ -10,6 +10,7 @@
 
 import asyncio
 import http
+import logging
 import secrets
 import ssl
 
@@ -23,6 +24,22 @@ PAIRING_TIMEOUT = 180    # seconds to wait for the /cable/connect/ peer
 
 # routing_id (bytes) -> (tunnel_id: bytes, new_websocket, peer_future)
 pending = {}
+
+
+class _SuppressHandshakeTracebacks(logging.Filter):
+    """Random clients (port scanners, health checks, ...) constantly hit
+    :443 without doing a WebSocket handshake; websockets logs each as an
+    ERROR with a full traceback. Replace that with a one-line message."""
+
+    def filter(self, record):
+        if record.msg == "opening handshake failed":
+            exc = record.exc_info[1] if record.exc_info else None
+            print(f"Rejected non-WebSocket connection: {exc!r}")
+            return False
+        return True
+
+
+logging.getLogger("websockets.server").addFilter(_SuppressHandshakeTracebacks())
 
 
 def _parse_path(path):
