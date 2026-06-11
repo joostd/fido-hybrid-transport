@@ -1,0 +1,12 @@
+[project]
+name = "authenticator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "cbor2>=6.1.2",
+    "cryptography>=48.0.0",
+    "fido2>=2.0.0",
+    "websockets>=16.0",
+]

@@ -12,7 +12,7 @@ a single get-info / make-credential / get-assertion request.
 
 ## deps
 
-sudo apt install libdbus-1-dev libglib2.0-dev
+sudo apt install libdbus-1-dev libglib2.0-dev python3-gi python3-dbus python3-cairo
 
 ## venv
 
@@ -20,6 +20,16 @@ python3 -m venv --system-site-packages venv
 . venv/bin/activate
 
 pip install cbor2 websockets cryptography dbus-python fido2
+
+### using uv instead
+
+`gi` (PyGObject, for the BLE-advertising GLib mainloop) and `dbus` come from
+the system packages above and aren't installable as plain wheels, so create
+uv's `.venv` with `--system-site-packages` so it can see them:
+
+    uv venv --system-site-packages
+    uv sync
+    uv run main.py FIDO://...
 
 ## cert
 
@@ -30,12 +40,14 @@ ln -s /etc/letsencrypt/live/cable.pyzci7hxyjsvc.org/privkey.pem
 
 # run
 
-    sudo -s # must run as root
     source venv/bin/activate
     python main.py FIDO://... # scan the QR code from a CTAP client and paste the decoded FIDO URL
 
 Point an existing CTAP 2.3 client at the Pi's WebSocket endpoint;
 confirm the Noise handshake completes and `get-info` returns a valid response
+
+Root is only required to bind port 443 (`--tunnel-server self` or
+`--remote-usb`); run as root (`sudo -s`) in that case.
 
 ## USB mode
 

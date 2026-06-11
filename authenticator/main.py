@@ -646,10 +646,6 @@ def run_asyncio():
 
 ### Setup ###
 
-if os.getuid() != 0:
-    print("Need root!")
-    sys.exit(1)
-
 arg_parser = argparse.ArgumentParser(description="FIDO CDA Authenticator using CTAP hybrid transport")
 arg_parser.add_argument('fido_uri', metavar='FIDO-URI', help="FIDO:/... URI decoded from the QR code")
 arg_parser.add_argument('--usb', action='store_true',
@@ -668,6 +664,13 @@ args = arg_parser.parse_args()
 
 if args.usb and args.remote_usb:
     arg_parser.error("--usb and --remote-usb are mutually exclusive")
+
+# Binding port 443 (self-hosted tunnel server, or the --remote-usb relay
+# endpoint) requires root. BLE advertising via D-Bus may also need root
+# unless a polkit policy grants the current user access to org.bluez.
+if (args.tunnel_server == 'self' or args.remote_usb) and os.getuid() != 0:
+    print("Need root to bind port 443 (--tunnel-server self or --remote-usb).")
+    sys.exit(1)
 
 fido_uri = args.fido_uri
 
