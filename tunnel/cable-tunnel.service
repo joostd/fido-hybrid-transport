@@ -1,0 +1,16 @@
+# /etc/systemd/system/cable-tunnel.service
+[Unit]
+Description=caBLE tunnel relay
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/cable/fido-hybrid-transport/tunnel
+ExecStart=/opt/cable/fido-hybrid-transport/tunnel/.venv/bin/python main.py
+Restart=on-failure
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadOnlyPaths=/etc/letsencrypt
+
+[Install]
+WantedBy=multi-user.target
