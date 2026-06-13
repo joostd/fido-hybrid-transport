@@ -33,6 +33,55 @@ Use with `authenticator/main.py --tunnel-server local`, which registers a
 tunnel here (instead of with Google) and embeds `cable.pyzci7hxyjsvc.org` in
 the BLE advert.
 
+## testing
+
+To verify the relay is up and routing correctly, without running the full
+authenticator/client BLE flow:
+
+### handshake (curl)
+
+curl >= 8.x has built-in `ws://`/`wss://` support, enough to check the
+`/cable/new/` registration and `/cable/connect/` reject path:
+
+    # register a tunnel, get a routing ID back
+    TUNNEL_ID=$(openssl rand -hex 16)
+    curl -sv --http1.1 -m 5 \
+      -H "Sec-WebSocket-Protocol: fido.cable" \
+      -H "Origin: wss://cable.pyzci7hxyjsvc.org" \
+      "wss://cable.pyzci7hxyjsvc.org/cable/new/$TUNNEL_ID"
+    # -> 101 Switching Protocols, X-caBLE-Routing-ID: <hex>
+
+    # unknown routing ID is rejected
+    curl -sv --http1.1 -m 5 \
+      -H "Sec-WebSocket-Protocol: fido.cable" \
+      -H "Origin: wss://cable.pyzci7hxyjsvc.org" \
+      "wss://cable.pyzci7hxyjsvc.org/cable/connect/<bogus_routing_id>/$TUNNEL_ID"
+    # -> 404 Not Found
+
+### two-way relay (websocat)
+
+For an end-to-end test of the actual relay (pairing `/cable/new/` with
+`/cable/connect/` and exchanging bytes), use
+[websocat](https://github.com/vi/websocat) ("netcat for websockets"):
+
+    cargo install websocat
+
+Terminal 1 (registers the tunnel; look for `X-CaBLE-Routing-ID` in the `-v`
+log output):
+
+    TUNNEL_ID=$(openssl rand -hex 16)
+    echo "tunnel_id: $TUNNEL_ID"
+    websocat -v --protocol fido.cable --origin wss://cable.pyzci7hxyjsvc.org \
+      "wss://cable.pyzci7hxyjsvc.org/cable/new/$TUNNEL_ID"
+
+Terminal 2 (connects using that routing ID + the same tunnel ID):
+
+    websocat --protocol fido.cable --origin wss://cable.pyzci7hxyjsvc.org \
+      "wss://cable.pyzci7hxyjsvc.org/cable/connect/<routing_id>/$TUNNEL_ID"
+
+Once both are connected, anything typed (+ Enter) in one terminal should
+appear in the other, confirming the relay pipes frames bidirectionally.
+
 ## running as a systemd service
 
 For a persistent deployment, run the relay under systemd instead of a
