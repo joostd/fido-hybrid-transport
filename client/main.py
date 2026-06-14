@@ -8,6 +8,7 @@ import time
 import asyncio
 import hmac
 import hashlib
+import json
 import secrets
 import argparse
 from bleak import BleakScanner
@@ -25,7 +26,7 @@ import websockets
 from fido2.hid import CtapHidDevice, CTAPHID, ConnectionFailure
 from fido2.ctap import CtapError
 
-from cable_noise import NoiseHandshake, KeyPair, PATTERN_KN_PSK0, pad_message, unpad_message
+from cable_noise import NoiseHandshake, KeyPair, PATTERN_KN_PSK0, pad_message, unpad_message, dh
 from ctap_usb import select_usb_device
 
 _parser = argparse.ArgumentParser(description="FIDO caBLE client")
@@ -99,7 +100,7 @@ authenticatorData = {
   1: qrSecret,
   2: len(assignedTunnelServerDomains),
   3: timestamp,
-  4: False,
+  4: True,  # this client can perform state-assisted transactions (sctn-hybrid-state-assisted)
   5: args.hint if args.hint else ('mc' if args.command == 'make-credential' else 'ga')
 }
 fido = fido_encode(authenticatorData)
@@ -109,6 +110,16 @@ print( "FIDO:/" + fido )
 keyPurposeEIDKey   = bytes.fromhex('01000000')
 keyPurposeTunnelID = bytes.fromhex('02000000')
 keyPurposePSK      = bytes.fromhex('03000000')
+
+# Post-handshake message types (CTAP 2.3 sctn-hybrid Data Transfer).
+CTAP_FRAME_SHUTDOWN = 0x00
+CTAP_FRAME_CTAP     = 0x01
+CTAP_FRAME_UPDATE   = 0x02
+
+# Linking info (CTAP 2.3 sctn-hybrid-state-assisted), keyed by the
+# authenticator's public key so repeat links from the same authenticator
+# overwrite each other.
+LINKED_AUTHENTICATORS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "linked_authenticators.json")
 
 uuid = '0000fff9-0000-1000-8000-00805f9b34fb'
 
@@ -157,6 +168,73 @@ async def ping(uri):
          #wait for the corresponding pong
         latency = await pong_waiter
         print(f"Latency: {latency}")
+
+
+def _load_linked_authenticators():
+    try:
+        with open(LINKED_AUTHENTICATORS_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def _save_linked_authenticators(linked):
+    with open(LINKED_AUTHENTICATORS_PATH, "w") as f:
+        json.dump(linked, f, indent=2)
+
+
+def _handle_update_message(payload, handshake_hash, tunnel_server_domain):
+    """Handle a type-2 update message. If it carries linking info (CTAP 2.3
+    sctn-hybrid-state-assisted), verify it and persist it for later use."""
+    update = loads(payload)
+    linking = update.get(1) if isinstance(update, dict) else None
+    if linking is None:
+        return
+
+    contact_id  = linking[1]
+    link_id     = linking[2]
+    link_secret = linking[3]
+    auth_pubkey = linking[4]
+    auth_name   = linking[5]
+    signature   = linking[6]
+
+    # The authenticator's "signature" is an HMAC of the handshake hash, keyed
+    # by ECDH(authenticator's link pubkey, this session's QR identity key) --
+    # it proves the authenticator holds the private key matching auth_pubkey.
+    shared_key = dh(private_key, auth_pubkey)
+    expected_signature = hmac.new(shared_key, handshake_hash, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected_signature, signature):
+        print(f"Linking info from {auth_name!r}: signature verification failed -- ignoring")
+        return
+
+    linked = _load_linked_authenticators()
+    linked[auth_pubkey.hex()] = {
+        "name": auth_name,
+        "contact_id": contact_id.hex(),
+        "link_id": link_id.hex(),
+        "link_secret": link_secret.hex(),
+        "tunnel_server_domain": tunnel_server_domain,
+    }
+    _save_linked_authenticators(linked)
+    print(f"Linking info received and verified for {auth_name!r} -- saved to {LINKED_AUTHENTICATORS_PATH}")
+
+
+def _send_ctap_and_recv(websocket, send_cipher, receive_cipher, ctap_payload, handshake_hash, tunnel_server_domain):
+    """Send a CTAP request frame and read frames until the CTAP response,
+    handling any interleaved update (linking info) messages along the way."""
+    frame = bytes([CTAP_FRAME_CTAP]) + ctap_payload
+    websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(frame)))
+    while True:
+        raw = websocket.recv(timeout=10)
+        resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+        frame_type, body = resp[0], resp[1:]
+        if frame_type == CTAP_FRAME_CTAP:
+            return body
+        if frame_type == CTAP_FRAME_UPDATE:
+            _handle_update_message(body, handshake_hash, tunnel_server_domain)
+            continue
+        print(f"Unexpected frame type 0x{frame_type:02x} -- ignoring")
+
 
 if __name__ == "__main__":
     eidKey = derive(secret=qrSecret, purpose=keyPurposeEIDKey)
@@ -231,6 +309,7 @@ if __name__ == "__main__":
             result = hs.finish()
             send_cipher = result.send_cipher
             receive_cipher = result.receive_cipher
+            handshake_hash = result.handshake_hash
             print("Noise handshake complete.")
 
             # Post-handshake: server sends {1: cbor_info_bytes} immediately after handshake.
@@ -238,16 +317,10 @@ if __name__ == "__main__":
             post_hs = loads(unpad_message(receive_cipher.decrypt_with_ad(b"", raw)))
             print(f"Post-handshake cached getInfo: {post_hs}")
 
-            CTAP_FRAME_CTAP = 0x01
-
             if args.command == 'get-info':
-                ctap_frame = bytes([CTAP_FRAME_CTAP, 0x04])
-                websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
-                print("Sent CTAP getInfo.")
-                raw = websocket.recv(timeout=10)
-                resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
-                status = resp[1]
-                print(f"CTAP getInfo response: status=0x{status:02x}, info={loads(resp[2:])}")
+                body = _send_ctap_and_recv(websocket, send_cipher, receive_cipher, bytes([0x04]), handshake_hash, tunnelServerDomain)
+                status = body[0]
+                print(f"CTAP getInfo response: status=0x{status:02x}, info={loads(body[1:])}")
 
             elif args.command == 'make-credential':
                 client_data_hash = secrets.token_bytes(32)
@@ -257,15 +330,11 @@ if __name__ == "__main__":
                     3: {'id': b'user01', 'name': 'Test User'},
                     4: [{'type': 'public-key', 'alg': -7}],
                 }, canonical=True)
-                ctap_frame = bytes([CTAP_FRAME_CTAP, 0x01]) + mc_req
-                websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
-                print(f"Sent CTAP makeCredential (rp={args.rp_id}).")
-                raw = websocket.recv(timeout=10)
-                resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
-                status = resp[1]
+                body = _send_ctap_and_recv(websocket, send_cipher, receive_cipher, bytes([0x01]) + mc_req, handshake_hash, tunnelServerDomain)
+                status = body[0]
                 print(f"CTAP makeCredential response: status=0x{status:02x}")
                 if status == 0x00:
-                    print(f"  response map: {loads(resp[2:])}")
+                    print(f"  response map: {loads(body[1:])}")
 
             elif args.command == 'get-assertion':
                 client_data_hash = secrets.token_bytes(32)
@@ -273,15 +342,11 @@ if __name__ == "__main__":
                     1: args.rp_id,
                     2: client_data_hash,
                 }, canonical=True)
-                ctap_frame = bytes([CTAP_FRAME_CTAP, 0x02]) + ga_req
-                websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
-                print(f"Sent CTAP getAssertion (rp={args.rp_id}).")
-                raw = websocket.recv(timeout=10)
-                resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
-                status = resp[1]
+                body = _send_ctap_and_recv(websocket, send_cipher, receive_cipher, bytes([0x02]) + ga_req, handshake_hash, tunnelServerDomain)
+                status = body[0]
                 print(f"CTAP getAssertion response: status=0x{status:02x}")
                 if status == 0x00:
-                    print(f"  response map: {loads(resp[2:])}")
+                    print(f"  response map: {loads(body[1:])}")
 
             elif args.command == 'stdio-relay':
                 # Generic CTAP relay over a pair of pipes — the hybrid-transport

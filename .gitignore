@@ -9,3 +9,6 @@ venv/
 
 # keys/certs
 authenticator/*.pem
+
+# state-assisted linking secrets
+client/linked_authenticators.json
