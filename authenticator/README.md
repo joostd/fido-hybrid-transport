@@ -11,6 +11,29 @@ generates a FIDO URI/QR code, does the BLE scan + Noise handshake, and sends
 CTAP commands (get-info, make-credential, get-assertion) or runs in relay
 modes (usb-relay, stdio-relay).
 
+## Platform Support
+
+**Tested on:** Raspberry Pi (Raspberry Pi OS / Raspbian)
+
+**BLE Advertising Requirements:**
+
+The authenticator requires the ability to send Bluetooth Low Energy advertisements
+with custom service data (the encrypted EID for caBLE discovery). This relies on:
+
+- **BlueZ** 5.x or later (Linux Bluetooth stack)
+- **D-Bus** system bus access to `org.bluez.LEAdvertisingManager1`
+- **Bluetooth hardware** with BLE support (built-in on Raspberry Pi 3/4/5)
+
+On Raspberry Pi, BLE advertising via D-Bus works out of the box. On other Linux
+distributions, you may need:
+
+- To grant your user D-Bus permissions for BlueZ (via polkit policy)
+- To run as root (for D-Bus access to BlueZ)
+- To verify BlueZ supports the LE Advertising API (`btmgmt info` should show "le" and "advertising")
+
+**Not tested on:** macOS (BLE advertising APIs are different), other Linux distributions
+(may work but require additional D-Bus/BlueZ configuration).
+
 ## deps
 
 sudo apt install libdbus-1-dev libglib2.0-dev python3-gi python3-dbus python3-cairo
