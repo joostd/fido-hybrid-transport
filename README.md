@@ -56,6 +56,15 @@ This allows sk-hybrid.so to delegate all BLE scanning, QR display, tunnel connec
 
 FIDO2 authenticator implementing hybrid transport with software or USB backend.
 
+**Platform Requirements:**
+
+Tested on Raspberry Pi (Raspberry Pi OS). Requires BLE advertising with custom service data:
+- BlueZ 5.x or later
+- D-Bus access to `org.bluez.LEAdvertisingManager1`
+- BLE-capable Bluetooth hardware
+
+On Raspberry Pi, BLE advertising works out of the box. Other Linux systems may require D-Bus permissions or running as root. Not tested on macOS (different BLE APIs).
+
 **Usage:**
 
 ```bash
