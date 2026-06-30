@@ -1,7 +1,8 @@
 # caBLE Tunnel Relay
 
 tunnel/main.py is a self-hosted replacement for Google's undocumented
-`cable.ua5v.com` caBLE tunnel relay. It implements the same two endpoints:
+`cable.ua5v.com` caBLE tunnel relay. It implements the same WebSocket-based
+two-endpoint protocol:
 
 - `wss://<host>/cable/new/<tunnel_id_hex>` -- the authenticator registers a
   tunnel and gets back a 101 response with an `X-caBLE-Routing-ID` header.
@@ -12,6 +13,8 @@ tunnel/main.py is a self-hosted replacement for Google's undocumented
 The relay never sees plaintext (the Noise handshake and all CTAP messages are
 end-to-end encrypted between the authenticator and the initiator) -- it just
 pipes binary WebSocket frames between the two connections.
+
+For usage examples and integration with the client/authenticator components, see the main [README](../README.md).
 
 ## cert
 

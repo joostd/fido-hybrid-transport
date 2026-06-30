@@ -2,13 +2,14 @@
 
 authenticator/main.py plays the CTAP "authenticator" role over hybrid
 transport (caBLE): it does the BLE advert + Noise(KNpsk0) handshake with a
-real browser, then answers CTAP requests either with its built-in software
-authenticator or (with --usb) by relaying them verbatim to a USB security
-key plugged into the same machine via fido2.hid.CtapHidDevice.
+real browser or client, then answers CTAP requests either with its built-in
+software authenticator or (with --usb / --remote-usb) by relaying them to a
+USB security key via fido2.hid.CtapHidDevice.
 
 client/main.py is a test tool playing the "platform"/browser role: it
 generates a FIDO URI/QR code, does the BLE scan + Noise handshake, and sends
-a single get-info / make-credential / get-assertion request.
+CTAP commands (get-info, make-credential, get-assertion) or runs in relay
+modes (usb-relay, stdio-relay).
 
 ## deps
 
@@ -71,10 +72,12 @@ its LED and touch it when it blinks.
 
     Browser  <--caBLE (BLE+Noise, existing)-->  authenticator/main.py  <--WSS relay-->  client/main.py (usb-relay mode)  <--USB HID-->  Security key
 
-	--remote-usb mode forwards the raw CTAP request/response bytes over a second WebSocket connection to client, which
- forwards them to/from a local USB key -- mirroring the existing --usb
- relay, just over the network.
+`--remote-usb` mode forwards the raw CTAP request/response bytes over a second WebSocket connection to client, which
+forwards them to/from a local USB key -- mirroring the existing --usb
+relay, just over the network.
 
 client dials out to authenticator (which already self-hosts a public WSS server with a real TLS cert on :443), using a new path containing a random secret token; security relies on wss:// (TLS) plus that unguessable path -- no extra Noise/PSK layer for this channel.
+
+**⚠️ Security Warning:** When using `--remote-usb`, you must fully trust the remote client. The client can send CTAP commands for any RP ID, potentially causing you to authenticate to unintended services. Only use this mode when you control both machines. See the main [README](../README.md) for security considerations.
 
 
