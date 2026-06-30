@@ -30,7 +30,7 @@ from ctap_usb import select_usb_device
 
 _parser = argparse.ArgumentParser(description="FIDO caBLE client")
 _parser.add_argument('command', nargs='?',
-                     choices=['get-info', 'make-credential', 'get-assertion', 'usb-relay'],
+                     choices=['get-info', 'make-credential', 'get-assertion', 'usb-relay', 'stdio-relay'],
                      default='get-info')
 _parser.add_argument('--rp-id', default='example.com')
 _parser.add_argument('--server', help="wss://.../usb-relay/<token> URL (for usb-relay)")
@@ -188,7 +188,7 @@ if __name__ == "__main__":
     print(f"routingID: { routingID.hex() }")
     print(f"tunnel_serviceID: { tunnel_serviceID.hex() }")
     encodedTunnelServerDomain = tunnel_serviceID[0] + (tunnel_serviceID[1] << 8)
-    # Values zero through 255 are assigned, and values >= 256 are translated into a domain name by hashing. 
+    # Values zero through 255 are assigned, and values >= 256 are translated into a domain name by hashing.
     assert(encodedTunnelServerDomain >= 0 and (encodedTunnelServerDomain < len(assignedTunnelServerDomains) or encodedTunnelServerDomain > 255))
     if encodedTunnelServerDomain > 255:
         tunnelServerDomain = 'cable.pyzci7hxyjsvc.org' # TODO hardcoding 0x0105 here, calculate domain name instead
@@ -281,6 +281,66 @@ if __name__ == "__main__":
                 print(f"CTAP getAssertion response: status=0x{status:02x}")
                 if status == 0x00:
                     print(f"  response map: {loads(resp[2:])}")
+
+            elif args.command == 'stdio-relay':
+                # Generic CTAP relay over a pair of pipes — the hybrid-transport
+                # analogue of usb-relay.  An external process (sk-hybrid.so/dylib,
+                # an OpenSSH SSH_SK_PROVIDER) writes length-prefixed CTAP request
+                # frames to our fd 3 and reads length-prefixed CTAP response frames
+                # back from our fd 4.
+                #
+                # Wire format on both pipes:
+                #   [4-byte big-endian payload length] [payload bytes]
+                #
+                # Request payload (fd 3 → here → phone):
+                #   [0x01 CTAP_FRAME_CTAP] [CTAP cmd byte] [CBOR params...]
+                #   This is forwarded verbatim to the phone via the Noise tunnel.
+                #
+                # Response payload (phone → here → fd 4):
+                #   The raw caBLE Noise payload from the phone is:
+                #     [0x01 frame_type] [CTAP status] [CBOR body...]
+                #   We strip the leading frame-type byte before writing to fd 4,
+                #   so the C consumer sees [CTAP status] [CBOR body...] directly.
+                #   (The C code also defensively strips the 0x01 prefix if present,
+                #   so if your cable_noise.unpad_message already strips it, the
+                #   result is the same either way — no double-stripping occurs.)
+                #
+                # fds 0/1/2 stay attached to the real terminal throughout (the QR
+                # code, BLE scan output, and tunnel status printed above remain
+                # visible to the user who needs to scan with their phone).
+                import sys as _sys
+                relay_in  = os.fdopen(3, 'rb')
+                relay_out = os.fdopen(4, 'wb')
+                print("sk-hybrid relay ready; waiting for CTAP frames on fd 3.",
+                      file=_sys.stderr, flush=True)
+                while True:
+                    # Read one length-prefixed request frame from the C side.
+                    lenbuf = relay_in.read(4)
+                    if len(lenbuf) < 4:
+                        break  # C side closed the pipe — done
+                    n = int.from_bytes(lenbuf, 'big')
+                    ctap_frame = relay_in.read(n)
+                    if len(ctap_frame) < n:
+                        break  # truncated — shouldn't happen, but bail cleanly
+
+                    # Forward the CTAP frame to the phone over the Noise tunnel.
+                    websocket.send(
+                        send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
+
+                    # Receive the phone's response.
+                    raw = websocket.recv(timeout=30)
+                    resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+
+                    # Strip the caBLE frame-type prefix byte (0x01) so that the
+                    # payload written to fd 4 is [CTAP_status, CBOR_body...].
+                    # main.py's own command handlers access resp[1] for the status
+                    # (resp[0] being the frame-type byte), which confirms this byte
+                    # is present in the raw unpadded payload.
+                    ctap_resp = resp[1:] if (resp and resp[0] == 0x01) else resp
+
+                    relay_out.write(len(ctap_resp).to_bytes(4, 'big'))
+                    relay_out.write(ctap_resp)
+                    relay_out.flush()
 
         except websockets.exceptions.ConnectionClosedOK as e:
             print(f"Connection closed OK: {e}")
