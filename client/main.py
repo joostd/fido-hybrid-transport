@@ -315,12 +315,15 @@ if __name__ == "__main__":
             # Post-handshake: server sends {1: cbor_info_bytes} immediately after handshake.
             raw = websocket.recv(timeout=10)
             post_hs = loads(unpad_message(receive_cipher.decrypt_with_ad(b"", raw)))
-            print(f"Post-handshake cached getInfo: {post_hs}")
+            # The post-handshake message contains {1: raw_cbor_encoded_info_map}
+            cached_info = loads(post_hs[1])
+            print(f"Post-handshake cached getInfo: {cached_info}")
 
             if args.command == 'get-info':
-                body = _send_ctap_and_recv(websocket, send_cipher, receive_cipher, bytes([0x04]), handshake_hash, tunnelServerDomain)
-                status = body[0]
-                print(f"CTAP getInfo response: status=0x{status:02x}, info={loads(body[1:])}")
+                # Use the cached getInfo from the post-handshake message instead of
+                # sending a redundant request. iOS does not respond to the redundant
+                # getInfo, and the spec already provides this information.
+                print(f"authenticatorGetInfo: {cached_info}")
 
             elif args.command == 'make-credential':
                 client_data_hash = secrets.token_bytes(32)

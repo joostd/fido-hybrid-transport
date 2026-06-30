@@ -40,6 +40,8 @@ python client/main.py usb-relay --server wss://example.com/usb-relay/token123
 python client/main.py stdio-relay --hint mc
 ```
 
+**Note:** In single-command mode (get-info, make-credential, get-assertion), the client sends one CTAP command and exits. Your phone may display "Devices couldn't connect" or timeout after the client closes - this is expected behavior. For persistent connections, use `stdio-relay` or `usb-relay` modes.
+
 **stdio-relay Mode:**
 
 The `stdio-relay` command enables external processes (like [sk-hybrid.so](https://github.com/joostd/openssh-hybrid-sk-provider)) to use the caBLE transport by reading/writing length-prefixed CTAP frames over pipes:

@@ -38,6 +38,20 @@ Run the client and scan the QR code on your iPhone or Android device.
 
 You can also use the authenticator in [../authenticator](../authenticator) with the FIDO: URI.
 
+## Expected Behavior
+
+**Single-command mode** (`get-info`, `make-credential`, `get-assertion`):
+
+The client sends one CTAP command (or uses cached info for `get-info`) and then exits. After scanning the QR code and establishing the caBLE connection:
+
+1. **For `get-info`**: The client uses the cached authenticatorGetInfo from the post-handshake message (per caBLE spec) and exits immediately
+2. **For `make-credential` or `get-assertion`**: The client sends the CTAP command, the phone processes it (with user interaction), sends the response, and the client exits
+3. **The phone may show "Devices couldn't connect" or a timeout message** - this is expected behavior since the client closes the connection after receiving the response
+
+Note: `get-info` uses the cached response because the caBLE protocol already provides this in the post-handshake message. iOS does not respond to redundant getInfo requests.
+
+This is intended for testing individual CTAP commands. For persistent connections, use `stdio-relay` or `usb-relay` modes which keep the connection open until the external process closes the pipes.
+
 ## Commands
 
 - `get-info` - Query authenticator information (default)
