@@ -34,6 +34,7 @@ _parser.add_argument('command', nargs='?',
                      default='get-info')
 _parser.add_argument('--rp-id', default='example.com')
 _parser.add_argument('--server', help="wss://.../usb-relay/<token> URL (for usb-relay)")
+_parser.add_argument('--hint', choices=['mc', 'ga'], help="FIDO URI command hint (mc=makeCredential, ga=getAssertion)")
 args = _parser.parse_args()
 
 def _call_usb_device(usb_device, request):
@@ -99,7 +100,7 @@ authenticatorData = {
   2: len(assignedTunnelServerDomains),
   3: timestamp,
   4: False,
-  5: 'mc' if args.command == 'make-credential' else 'ga'
+  5: args.hint if args.hint else ('mc' if args.command == 'make-credential' else 'ga')
 }
 fido = fido_encode(authenticatorData)
 
@@ -327,16 +328,34 @@ if __name__ == "__main__":
                     websocket.send(
                         send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
 
-                    # Receive the phone's response.
-                    raw = websocket.recv(timeout=30)
-                    resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+                    # Receive the phone's response, skipping non-CTAP frames.
+                    # The phone can send caBLE linking-info messages (frame type != 0x01)
+                    # between the post-handshake getInfo and the CTAP response.
+                    # Loop until we get a CTAP frame or timeout.
+                    resp = None
+                    attempts = 0
+                    max_attempts = 5  # Allow up to 5 non-CTAP frames before giving up
+                    while attempts < max_attempts:
+                        try:
+                            raw = websocket.recv(timeout=30)
+                            resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+                            if resp and len(resp) > 0 and resp[0] == CTAP_FRAME_CTAP:
+                                # Got a CTAP frame - this is what we want
+                                break
+                            # Non-CTAP frame received; skip silently
+                            attempts += 1
+                        except Exception:
+                            # Timeout or other error
+                            resp = None
+                            break
 
                     # Strip the caBLE frame-type prefix byte (0x01) so that the
                     # payload written to fd 4 is [CTAP_status, CBOR_body...].
-                    # main.py's own command handlers access resp[1] for the status
-                    # (resp[0] being the frame-type byte), which confirms this byte
-                    # is present in the raw unpadded payload.
-                    ctap_resp = resp[1:] if (resp and resp[0] == 0x01) else resp
+                    if resp and len(resp) > 0 and resp[0] == CTAP_FRAME_CTAP:
+                        ctap_resp = resp[1:]
+                    else:
+                        # No valid CTAP response received; send error back to C
+                        ctap_resp = bytes([0x30])  # CTAP2_ERR_NOT_ALLOWED
 
                     relay_out.write(len(ctap_resp).to_bytes(4, 'big'))
                     relay_out.write(ctap_resp)
