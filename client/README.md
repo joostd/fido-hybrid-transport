@@ -83,5 +83,6 @@ The client displays the QR code and BLE scan output on the terminal (fds 0/1/2) 
 - `--display-name <name>` - User display name for make-credential (default: same as --user-name)
 - `--hint <mc|ga>` - FIDO URI command hint (mc=makeCredential, ga=getAssertion)
 - `--server <url>` - WebSocket server URL (for usb-relay mode)
+- `--log-level <DEBUG|INFO|WARNING|ERROR>` - Logging level (default: INFO). Use DEBUG to see all raw CTAP messages and tunnel establishment with hex dumps
 
 See the main [README](../README.md) for detailed usage and security considerations.

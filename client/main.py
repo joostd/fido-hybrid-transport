@@ -11,6 +11,7 @@ import hashlib
 import json
 import secrets
 import argparse
+import logging
 from bleak import BleakScanner
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -29,6 +30,100 @@ from fido2.ctap import CtapError
 from cable_noise import NoiseHandshake, KeyPair, PATTERN_KN_PSK0, pad_message, unpad_message, dh
 from ctap_usb import select_usb_device
 
+# CTAP2 status codes
+CTAP_STATUS_CODES = {
+    0x00: "CTAP2_OK",
+    0x01: "CTAP1_ERR_INVALID_COMMAND",
+    0x02: "CTAP1_ERR_INVALID_PARAMETER",
+    0x03: "CTAP1_ERR_INVALID_LENGTH",
+    0x04: "CTAP1_ERR_INVALID_SEQ",
+    0x05: "CTAP1_ERR_TIMEOUT",
+    0x06: "CTAP1_ERR_CHANNEL_BUSY",
+    0x0A: "CTAP1_ERR_LOCK_REQUIRED",
+    0x0B: "CTAP1_ERR_INVALID_CHANNEL",
+    0x10: "CTAP2_ERR_CBOR_UNEXPECTED_TYPE",
+    0x11: "CTAP2_ERR_INVALID_CBOR",
+    0x12: "CTAP2_ERR_MISSING_PARAMETER",
+    0x13: "CTAP2_ERR_LIMIT_EXCEEDED",
+    0x14: "CTAP2_ERR_UNSUPPORTED_EXTENSION",
+    0x15: "CTAP2_ERR_CREDENTIAL_EXCLUDED",
+    0x16: "CTAP2_ERR_PROCESSING",
+    0x17: "CTAP2_ERR_INVALID_CREDENTIAL",
+    0x18: "CTAP2_ERR_USER_ACTION_PENDING",
+    0x19: "CTAP2_ERR_OPERATION_PENDING",
+    0x1A: "CTAP2_ERR_NO_OPERATIONS",
+    0x1B: "CTAP2_ERR_UNSUPPORTED_ALGORITHM",
+    0x1C: "CTAP2_ERR_OPERATION_DENIED",
+    0x1D: "CTAP2_ERR_KEY_STORE_FULL",
+    0x1E: "CTAP2_ERR_NOT_BUSY",
+    0x1F: "CTAP2_ERR_NO_OPERATION_PENDING",
+    0x20: "CTAP2_ERR_UNSUPPORTED_OPTION",
+    0x21: "CTAP2_ERR_INVALID_OPTION",
+    0x22: "CTAP2_ERR_KEEPALIVE_CANCEL",
+    0x23: "CTAP2_ERR_NO_CREDENTIALS",
+    0x24: "CTAP2_ERR_USER_ACTION_TIMEOUT",
+    0x25: "CTAP2_ERR_NOT_ALLOWED",
+    0x26: "CTAP2_ERR_PIN_INVALID",
+    0x27: "CTAP2_ERR_PIN_BLOCKED",
+    0x28: "CTAP2_ERR_PIN_AUTH_INVALID",
+    0x29: "CTAP2_ERR_PIN_AUTH_BLOCKED",
+    0x2A: "CTAP2_ERR_PIN_NOT_SET",
+    0x2B: "CTAP2_ERR_PIN_REQUIRED",
+    0x2C: "CTAP2_ERR_PIN_POLICY_VIOLATION",
+    0x2D: "CTAP2_ERR_PIN_TOKEN_EXPIRED",
+    0x2E: "CTAP2_ERR_REQUEST_TOO_LARGE",
+    0x2F: "CTAP2_ERR_ACTION_TIMEOUT",
+    0x30: "CTAP2_ERR_UP_REQUIRED",
+    0x7F: "CTAP1_ERR_OTHER",
+    0xDF: "CTAP2_ERR_SPEC_LAST",
+}
+
+def _format_ctap_status(status):
+    """Format CTAP status code with name."""
+    name = CTAP_STATUS_CODES.get(status, "UNKNOWN")
+    return f"0x{status:02x} ({name})"
+
+def _pretty_format_cbor(obj, indent=0):
+    """Pretty-print CBOR object with proper indentation."""
+    spaces = "  " * indent
+    if isinstance(obj, dict):
+        lines = ["{"]
+        for k, v in obj.items():
+            key_str = f"{k}" if isinstance(k, int) else f"'{k}'"
+            if isinstance(v, (dict, list)):
+                lines.append(f"{spaces}  {key_str}: {_pretty_format_cbor(v, indent + 1)}")
+            elif isinstance(v, bytes):
+                if len(v) > 32:
+                    lines.append(f"{spaces}  {key_str}: <{len(v)} bytes>")
+                else:
+                    lines.append(f"{spaces}  {key_str}: {v.hex()}")
+            else:
+                lines.append(f"{spaces}  {key_str}: {v}")
+        lines.append(f"{spaces}}}")
+        return "\n".join(lines)
+    elif isinstance(obj, list):
+        if not obj:
+            return "[]"
+        lines = ["["]
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                lines.append(f"{spaces}  {_pretty_format_cbor(item, indent + 1)},")
+            elif isinstance(item, bytes):
+                if len(item) > 32:
+                    lines.append(f"{spaces}  <{len(item)} bytes>,")
+                else:
+                    lines.append(f"{spaces}  {item.hex()},")
+            else:
+                lines.append(f"{spaces}  {item},")
+        lines.append(f"{spaces}]")
+        return "\n".join(lines)
+    elif isinstance(obj, bytes):
+        if len(obj) > 32:
+            return f"<{len(obj)} bytes>"
+        return obj.hex()
+    else:
+        return str(obj)
+
 _parser = argparse.ArgumentParser(description="FIDO caBLE client")
 _parser.add_argument('command', nargs='?',
                      choices=['get-info', 'make-credential', 'get-assertion', 'usb-relay', 'stdio-relay'],
@@ -39,7 +134,16 @@ _parser.add_argument('--user-name', help="User name for make-credential (require
 _parser.add_argument('--display-name', help="User display name for make-credential (default: same as --user-name)")
 _parser.add_argument('--server', help="wss://.../usb-relay/<token> URL (for usb-relay)")
 _parser.add_argument('--hint', choices=['mc', 'ga'], help="FIDO URI command hint (mc=makeCredential, ga=getAssertion)")
+_parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO',
+                     help="Logging level (DEBUG shows all raw CTAP messages and tunnel establishment)")
 args = _parser.parse_args()
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, args.log_level),
+    format='[%(levelname)s] %(message)s',
+    stream=sys.stderr
+)
 
 # Validate and set defaults for make-credential
 if args.command == 'make-credential':
@@ -69,27 +173,28 @@ def _call_usb_device(usb_device, request):
         except CtapError as exc:
             return bytes([exc.code])
         except ConnectionFailure as exc:
-            print(f"  USB device connection failure: {exc} (attempt {attempt + 1}/3)")
+            logging.warning(f"USB device connection failure: {exc} (attempt {attempt + 1}/3)")
             time.sleep(0.1)
+    logging.error("USB device gave up after 3 retries")
     return bytes([0x30])  # CTAP2_ERR_NOT_ALLOWED -- gave up after retries
 
 
 if args.command == 'usb-relay':
     usb_device = select_usb_device()
     with connect(args.server, subprotocols=["fido.cable"]) as websocket:
-        print(f"Connected to relay: {args.server}")
+        logging.info(f"Connected to relay: {args.server}")
         try:
             for request in websocket:
-                print(f"Relay request ({len(request)} bytes): {request.hex()}")
+                logging.info(f"Relay request ({len(request)} bytes): {request.hex()}")
                 try:
                     response = _call_usb_device(usb_device, request)
                 except OSError as exc:
-                    print(f"USB device I/O error: {exc}")
+                    logging.error(f"USB device I/O error: {exc}")
                     break
-                print(f"Relay response ({len(response)} bytes): {response.hex()}")
+                logging.info(f"Relay response ({len(response)} bytes): {response.hex()}")
                 websocket.send(response)
         except websockets.exceptions.ConnectionClosed as exc:
-            print(f"Relay connection closed: {exc}")
+            logging.info(f"Relay connection closed: {exc}")
     sys.exit(0)
 
 def fido_encode(data):
@@ -102,16 +207,14 @@ def fido_encode(data):
   decimals = [ str(int.from_bytes(b)) for b in chunks ]
   return "".join( [ i.rjust(17,"0") for i in decimals[:-1]] + [ decimals[-1] ] )
 
-#qrSecret = bytes.fromhex('b2c251f13fcc397bc753121d7953b491')
 qrSecret = secrets.token_bytes(16)
 private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
 public_key = private_key.public_key()
 pubKey = public_key.public_bytes(encoding=serialization.Encoding.X962, format=serialization.PublicFormat.CompressedPoint)
 pubKeyUncompressed = public_key.public_bytes(encoding=serialization.Encoding.X962, format=serialization.PublicFormat.UncompressedPoint)
-print(f"compressed public key: {pubKey.hex()}")
-print(f"uncompressed public key: {pubKeyUncompressed.hex()}")
-timestamp = int(time.time())
-#timestamp = 1234567890  # timestamp does not seem to be used?
+logging.debug(f"compressed public key: {pubKey.hex()}")
+logging.debug(f"uncompressed public key: {pubKeyUncompressed.hex()}")
+timestamp = int(time.time()) # timestamp does not seem to be used?
 
 assignedTunnelServerDomains = ["cable.ua5v.com", "cable.auth.com"] # Google, Apple
 
@@ -125,7 +228,7 @@ authenticatorData = {
 }
 fido = fido_encode(authenticatorData)
 
-print( "FIDO:/" + fido )
+logging.info("FIDO:/" + fido)
 
 keyPurposeEIDKey   = bytes.fromhex('01000000')
 keyPurposeTunnelID = bytes.fromhex('02000000')
@@ -151,7 +254,8 @@ async def scan():
     async with BleakScanner() as scanner:
         async for bleDevice, advertisement_data in scanner.advertisement_data():
           if uuid in advertisement_data.service_data.keys():
-            print(f"Received: {advertisement_data!r}")
+            logging.debug(f"BLE advertisement received: {advertisement_data!r}")
+            logging.info(f"Received: {advertisement_data!r}")
             return advertisement_data.service_data[uuid]
 
 
@@ -164,30 +268,26 @@ def derive(secret, salt=b'', purpose=None):
 
 def trialDecrypt(eidKey, cableData):
     aesKey = eidKey[:32]
-    print(f"AES Key:  { aesKey.hex() }")
     hmacKey = eidKey[32:]
-    print(f"HMAC Key: { hmacKey.hex() }")
+    logging.debug(f"AES Key:  {aesKey.hex()}")
+    logging.debug(f"HMAC Key: {hmacKey.hex()}")
     ciphertext = cableData[:16]
     h = hmac.new(hmacKey, ciphertext, hashlib.sha256).digest()
-    #print(h.hexdigest())
-    #print(f"HMAC-SHA256: {h[:4]}")
-    #print(cableData[16:])
     if h[:4] != cableData[16:]:
         return None
     cipher = Cipher(algorithms.AES(aesKey), modes.ECB())
     decryptor = cipher.decryptor()
     plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-    #print(plaintext.hex())
     assert(plaintext[0] == 0)
     return plaintext
 
 async def ping(uri):
     async with websockets.connect(uri) as websocket:
-        print(f"connected to { uri }")
+        logging.info(f"connected to {uri}")
         pong_waiter = await websocket.ping()
          #wait for the corresponding pong
         latency = await pong_waiter
-        print(f"Latency: {latency}")
+        logging.info(f"Latency: {latency}")
 
 
 def _load_linked_authenticators():
@@ -224,7 +324,7 @@ def _handle_update_message(payload, handshake_hash, tunnel_server_domain):
     shared_key = dh(private_key, auth_pubkey)
     expected_signature = hmac.new(shared_key, handshake_hash, hashlib.sha256).digest()
     if not hmac.compare_digest(expected_signature, signature):
-        print(f"Linking info from {auth_name!r}: signature verification failed -- ignoring")
+        logging.warning(f"Linking info from {auth_name!r}: signature verification failed -- ignoring")
         return
 
     linked = _load_linked_authenticators()
@@ -236,7 +336,7 @@ def _handle_update_message(payload, handshake_hash, tunnel_server_domain):
         "tunnel_server_domain": tunnel_server_domain,
     }
     _save_linked_authenticators(linked)
-    print(f"Linking info received and verified for {auth_name!r} -- saved to {LINKED_AUTHENTICATORS_PATH}")
+    logging.info(f"Linking info received and verified for {auth_name!r} -- saved to {LINKED_AUTHENTICATORS_PATH}")
 
 
 def _drain_update_frames(websocket, receive_cipher, handshake_hash, tunnel_server_domain, timeout=0.5):
@@ -246,15 +346,20 @@ def _drain_update_frames(websocket, receive_cipher, handshake_hash, tunnel_serve
     while True:
         try:
             raw = websocket.recv(timeout=timeout)
+            logging.debug(f"_drain_update_frames RECV encrypted ({len(raw)} bytes): {raw.hex()}")
             resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+            logging.debug(f"_drain_update_frames RECV decrypted ({len(resp)} bytes): {resp.hex()}")
             frame_type, body = resp[0], resp[1:]
             if frame_type == CTAP_FRAME_UPDATE:
+                logging.debug("_drain_update_frames received UPDATE frame")
                 _handle_update_message(body, handshake_hash, tunnel_server_domain)
                 continue
             # Got a non-UPDATE frame - shouldn't happen, but stop draining
+            logging.debug(f"_drain_update_frames got non-UPDATE frame (type 0x{frame_type:02x}), stopping")
             break
-        except Exception:
+        except Exception as e:
             # Timeout or other error means no more frames to read
+            logging.debug(f"_drain_update_frames exception (normal timeout): {e}")
             break
 
 
@@ -262,38 +367,48 @@ def _send_ctap_and_recv(websocket, send_cipher, receive_cipher, ctap_payload, ha
     """Send a CTAP request frame and read frames until the CTAP response,
     handling any interleaved update (linking info) messages along the way."""
     frame = bytes([CTAP_FRAME_CTAP]) + ctap_payload
-    websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(frame)))
+    encrypted = send_cipher.encrypt_with_ad(b"", pad_message(frame))
+    logging.debug(f"SEND CTAP frame ({len(frame)} bytes): {frame.hex()}")
+    logging.debug(f"SEND CTAP encrypted ({len(encrypted)} bytes): {encrypted.hex()}")
+    websocket.send(encrypted)
     while True:
         raw = websocket.recv(timeout=10)
+        logging.debug(f"RECV encrypted frame ({len(raw)} bytes): {raw.hex()}")
         resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+        logging.debug(f"RECV decrypted frame ({len(resp)} bytes): {resp.hex()}")
         frame_type, body = resp[0], resp[1:]
         if frame_type == CTAP_FRAME_CTAP:
+            logging.debug(f"RECV CTAP response ({len(body)} bytes): {body.hex()}")
             return body
         if frame_type == CTAP_FRAME_UPDATE:
+            logging.debug(f"RECV UPDATE frame ({len(body)} bytes): {body.hex()}")
             _handle_update_message(body, handshake_hash, tunnel_server_domain)
             continue
-        print(f"Unexpected frame type 0x{frame_type:02x} -- ignoring")
+        logging.warning(f"Unexpected frame type 0x{frame_type:02x} -- ignoring")
 
 
 if __name__ == "__main__":
     eidKey = derive(secret=qrSecret, purpose=keyPurposeEIDKey)
-    print(f"Key: { eidKey.hex() }")
+    logging.debug(f"Key: {eidKey.hex()}")
 
     payload = None
-    print("Scanning...")
+    logging.info("Scanning...")
     while True:
         cableData = asyncio.run(scan())
 
 
         #cableData = bytes.fromhex('f3bd42594d32f8b0dcbcf5e0302a9cfbec5f2a82')
         assert(len(cableData) == 20)
-        print(f"encrypted BLE advert: { cableData.hex() }")
+        logging.debug(f"BLE advert encrypted ({len(cableData)} bytes): {cableData.hex()}")
+        logging.info(f"encrypted BLE advert: {cableData.hex()}")
         # try to decrypt the cableData using eidKey
         payload = trialDecrypt(eidKey, cableData)
         if payload == None:
-            print("decryption failed - ignoring")
+            logging.debug("BLE advert decryption failed - not for this client")
+            logging.info("decryption failed - ignoring")
             continue
-        print(f"Decrypted: { payload.hex() }")
+        logging.debug(f"BLE advert decrypted ({len(payload)} bytes): {payload.hex()}")
+        logging.info(f"Decrypted: {payload.hex()}")
         break
 
     flags = payload[0:1]
@@ -301,10 +416,10 @@ if __name__ == "__main__":
     routingID = payload[11:14]
     tunnel_serviceID = payload[14:]
 
-    print(f"flags: { flags.hex() }")
-    print(f"nonce: { nonce.hex() }")
-    print(f"routingID: { routingID.hex() }")
-    print(f"tunnel_serviceID: { tunnel_serviceID.hex() }")
+    logging.debug(f"flags: {flags.hex()}")
+    logging.debug(f"nonce: {nonce.hex()}")
+    logging.debug(f"routingID: {routingID.hex()}")
+    logging.debug(f"tunnel_serviceID: {tunnel_serviceID.hex()}")
     encodedTunnelServerDomain = tunnel_serviceID[0] + (tunnel_serviceID[1] << 8)
     # Values zero through 255 are assigned, and values >= 256 are translated into a domain name by hashing.
     assert(encodedTunnelServerDomain >= 0 and (encodedTunnelServerDomain < len(assignedTunnelServerDomains) or encodedTunnelServerDomain > 255))
@@ -314,19 +429,20 @@ if __name__ == "__main__":
         tunnelServerDomain = assignedTunnelServerDomains[encodedTunnelServerDomain]
     tunnelID = derive(secret=qrSecret, purpose=keyPurposeTunnelID)[:16]
 
-    connectURL = "wss://" + tunnelServerDomain + "/cable/connect/" + routingID.hex() + "/" + tunnelID.hex() # TODO add TLS
-    print(connectURL)
+    connectURL = "wss://" + tunnelServerDomain + "/cable/connect/" + routingID.hex() + "/" + tunnelID.hex()
+    logging.debug(connectURL)
 
     with connect(connectURL, subprotocols=["fido.cable"],
                   additional_headers={"Origin": f"wss://{tunnelServerDomain}"}) as websocket:
         try:
-            print(f"connected to {connectURL}")
+            logging.debug(f"Tunnel connection established to {connectURL}")
+            logging.info(f"connected to {connectURL}")
 
             # PSK: salt is eid_plaintext (payload), not cableData (encrypted EID).
             # derive() is hardcoded to length=64; [:32] is safe because
             # HKDF T(1) is identical whether you request 32 or 64 bytes of output.
             psk = derive(secret=qrSecret, salt=payload, purpose=keyPurposePSK)[:32]
-            print(f"PSK: {psk.hex()}")
+            logging.debug(f"PSK: {psk.hex()}")
 
             local_static = KeyPair(private_key=private_key, public_bytes=pubKeyUncompressed)
 
@@ -338,31 +454,37 @@ if __name__ == "__main__":
             )
 
             msg1 = hs.write_message()
-            print(f"Sending msg1 ({len(msg1)} bytes): {msg1.hex()}")
+            logging.debug(f"SEND Noise msg1 ({len(msg1)} bytes): {msg1.hex()}")
+            logging.info(f"Sending msg1 ({len(msg1)} bytes): {msg1.hex()}")
             websocket.send(msg1)
 
             msg2 = websocket.recv(timeout=10)
-            print(f"Received msg2 ({len(msg2)} bytes): {msg2.hex()}")
+            logging.debug(f"RECV Noise msg2 ({len(msg2)} bytes): {msg2.hex()}")
+            logging.info(f"Received msg2 ({len(msg2)} bytes): {msg2.hex()}")
             hs.read_message(msg2)
 
             result = hs.finish()
             send_cipher = result.send_cipher
             receive_cipher = result.receive_cipher
             handshake_hash = result.handshake_hash
-            print("Noise handshake complete.")
+            logging.debug(f"Noise handshake complete, handshake_hash: {handshake_hash.hex()}")
+            logging.info("Noise handshake complete.")
 
             # Post-handshake: server sends {1: cbor_info_bytes} immediately after handshake.
             raw = websocket.recv(timeout=10)
+            logging.debug(f"RECV Post-handshake raw ({len(raw)} bytes): {raw.hex()}")
             post_hs = loads(unpad_message(receive_cipher.decrypt_with_ad(b"", raw)))
+            logging.debug(f"Post-handshake decrypted: {post_hs}")
             # The post-handshake message contains {1: raw_cbor_encoded_info_map}
             cached_info = loads(post_hs[1])
-            print(f"Post-handshake cached getInfo: {cached_info}")
+            logging.info(f"Post-handshake cached getInfo: {cached_info}")
 
             if args.command == 'get-info':
                 # Use the cached getInfo from the post-handshake message instead of
                 # sending a redundant request. iOS does not respond to the redundant
                 # getInfo, and the spec already provides this information.
-                print(f"authenticatorGetInfo: {cached_info}")
+                logging.info("CTAP2 authenticatorGetInfo response:")
+                logging.info(_pretty_format_cbor(cached_info))
 
             elif args.command == 'make-credential':
                 client_data_hash = secrets.token_bytes(32)
@@ -372,30 +494,44 @@ if __name__ == "__main__":
                 except ValueError:
                     user_id_bytes = args.user_id.encode('utf-8')
 
-                mc_req = dumps({
+                mc_req_params = {
                     1: client_data_hash,
                     2: {'id': args.rp_id, 'name': args.rp_id},
                     3: {'id': user_id_bytes, 'name': args.user_name, 'displayName': args.display_name},
                     4: [{'type': 'public-key', 'alg': -7}],
                     7: {'rk': True, 'uv': True},
-                }, canonical=True)
+                }
+                logging.info("CTAP2 authenticatorMakeCredential request:")
+                logging.info(_pretty_format_cbor(mc_req_params))
+
+                mc_req = dumps(mc_req_params, canonical=True)
                 body = _send_ctap_and_recv(websocket, send_cipher, receive_cipher, bytes([0x01]) + mc_req, handshake_hash, tunnelServerDomain)
                 status = body[0]
-                print(f"CTAP makeCredential response: status=0x{status:02x}")
+                logging.info(f"CTAP2 authenticatorMakeCredential response: {_format_ctap_status(status)}")
                 if status == 0x00:
-                    print(f"  response map: {loads(body[1:])}")
+                    resp_data = loads(body[1:])
+                    logging.info(_pretty_format_cbor(resp_data))
+                elif status != 0x00:
+                    logging.error(f"makeCredential failed with status {_format_ctap_status(status)}")
 
             elif args.command == 'get-assertion':
                 client_data_hash = secrets.token_bytes(32)
-                ga_req = dumps({
+                ga_req_params = {
                     1: args.rp_id,
                     2: client_data_hash,
-                }, canonical=True)
+                }
+                logging.info("CTAP2 authenticatorGetAssertion request:")
+                logging.info(_pretty_format_cbor(ga_req_params))
+
+                ga_req = dumps(ga_req_params, canonical=True)
                 body = _send_ctap_and_recv(websocket, send_cipher, receive_cipher, bytes([0x02]) + ga_req, handshake_hash, tunnelServerDomain)
                 status = body[0]
-                print(f"CTAP getAssertion response: status=0x{status:02x}")
+                logging.info(f"CTAP2 authenticatorGetAssertion response: {_format_ctap_status(status)}")
                 if status == 0x00:
-                    print(f"  response map: {loads(body[1:])}")
+                    resp_data = loads(body[1:])
+                    logging.info(_pretty_format_cbor(resp_data))
+                elif status != 0x00:
+                    logging.error(f"getAssertion failed with status {_format_ctap_status(status)}")
 
             elif args.command == 'stdio-relay':
                 # Generic CTAP relay over a pair of pipes — the hybrid-transport
@@ -430,8 +566,7 @@ if __name__ == "__main__":
                 import sys as _sys
                 relay_in  = os.fdopen(3, 'rb')
                 relay_out = os.fdopen(4, 'wb')
-                print("sk-hybrid relay ready; waiting for CTAP frames on fd 3.",
-                      file=_sys.stderr, flush=True)
+                logging.info("sk-hybrid relay ready; waiting for CTAP frames on fd 3.")
                 while True:
                     # Read one length-prefixed request frame from the C side.
                     lenbuf = relay_in.read(4)
@@ -442,9 +577,12 @@ if __name__ == "__main__":
                     if len(ctap_frame) < n:
                         break  # truncated — shouldn't happen, but bail cleanly
 
+                    logging.debug(f"RECV from fd3 ({len(ctap_frame)} bytes): {ctap_frame.hex()}")
+
                     # Forward the CTAP frame to the phone over the Noise tunnel.
-                    websocket.send(
-                        send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame)))
+                    encrypted = send_cipher.encrypt_with_ad(b"", pad_message(ctap_frame))
+                    logging.debug(f"SEND to tunnel encrypted ({len(encrypted)} bytes): {encrypted.hex()}")
+                    websocket.send(encrypted)
 
                     # Receive the phone's response, skipping non-CTAP frames.
                     # The phone can send caBLE linking-info messages (frame type != 0x01)
@@ -456,14 +594,19 @@ if __name__ == "__main__":
                     while attempts < max_attempts:
                         try:
                             raw = websocket.recv(timeout=30)
+                            logging.debug(f"RECV from tunnel encrypted ({len(raw)} bytes): {raw.hex()}")
                             resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+                            logging.debug(f"RECV from tunnel decrypted ({len(resp)} bytes): {resp.hex()}")
                             if resp and len(resp) > 0 and resp[0] == CTAP_FRAME_CTAP:
                                 # Got a CTAP frame - this is what we want
+                                logging.debug(f"RECV CTAP frame (type 0x{resp[0]:02x})")
                                 break
                             # Non-CTAP frame received; skip silently
+                            logging.debug(f"Non-CTAP frame (type 0x{resp[0]:02x}) - skipping")
                             attempts += 1
-                        except Exception:
+                        except Exception as e:
                             # Timeout or other error
+                            logging.debug(f"Exception receiving from tunnel: {e}")
                             resp = None
                             break
 
@@ -474,14 +617,12 @@ if __name__ == "__main__":
                     else:
                         # No valid CTAP response received; send error back to C
                         ctap_resp = bytes([0x30])  # CTAP2_ERR_NOT_ALLOWED
+                        logging.debug("No valid CTAP response, sending error 0x30")
 
+                    logging.debug(f"SEND to fd4 ({len(ctap_resp)} bytes): {ctap_resp.hex()}")
                     relay_out.write(len(ctap_resp).to_bytes(4, 'big'))
                     relay_out.write(ctap_resp)
                     relay_out.flush()
 
         except websockets.exceptions.ConnectionClosedOK as e:
-            print(f"Connection closed OK: {e}")
-
-    #loop = asyncio.new_event_loop()
-    #asyncio.set_event_loop(loop)
-    #loop.run_until_complete(ping(connectURL))
+            logging.info(f"Connection closed OK: {e}")
