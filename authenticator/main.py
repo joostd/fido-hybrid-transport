@@ -12,6 +12,7 @@ import asyncio
 import threading
 import hmac
 import hashlib
+import logging
 import secrets
 import ssl
 import struct
@@ -147,7 +148,7 @@ class Advertisement(dbus.service.Object):
             properties['Includes'] = dbus.Array(["tx-power"], signature='s')
         if self.data is not None:
             properties['Data'] = dbus.Dictionary(self.data, signature='yv')
-        print(properties)
+        logging.debug(properties)
         return {ADVERTISING_MANAGER_INTERFACE: properties}
 
     def get_path(self):
@@ -161,21 +162,21 @@ class Advertisement(dbus.service.Object):
 
     @dbus.service.method(ADVERTISING_MANAGER_INTERFACE, in_signature='', out_signature='')
     def Release(self):
-        print('%s: Released' % self.path)
+        logging.info('%s: Released', self.path)
 
 
 def register_ad_cb():
-    print('Advertisement registered OK')
+    logging.info('Advertisement registered OK')
 
 
 def register_ad_error_cb(error):
-    print('Error: Failed to register advertisement: ' + str(error))
+    logging.error('Failed to register advertisement: %s', error)
     mainloop.quit()
 
 
 def start_advertising():
     global adv, adv_mgr_interface
-    print("Registering advertisement", adv.get_path())
+    logging.info("Registering advertisement %s", adv.get_path())
     adv_mgr_interface.RegisterAdvertisement(
         adv.get_path(), {},
         reply_handler=register_ad_cb,
@@ -264,7 +265,7 @@ def _save_credential_store():
             })
     with open(CREDENTIAL_STORE_PATH, 'w') as f:
         json.dump(data, f, indent=2)
-    print(f"Credential store saved ({sum(len(v) for v in data.values())} credential(s))")
+    logging.info("Credential store saved (%d credential(s))", sum(len(v) for v in data.values()))
 
 
 # rpId -> list of {credentialId, privateKey, user, signCount}
@@ -421,21 +422,20 @@ def _cbor_to_display(obj):
 def _log_ctap_message(direction: str, data: bytes, names: dict) -> None:
     """Log a raw CTAP request/response: hex bytes plus decoded CBOR body."""
     if direction == 'request':
-        print(64*"-")
+        logging.info("-" * 64)
     if not data:
-        print(f"CTAP {direction}: (empty)")
+        logging.info("CTAP %s: (empty)", direction)
         return
     code = data[0]
     name = names.get(code, f"0x{code:02x}")
-    if args.verbose:
-        print(f"CTAP {direction}: {name} ({len(data)} bytes): {data.hex()}")
+    logging.debug("CTAP %s: %s (%d bytes): %s", direction, name, len(data), data.hex())
     if len(data) > 1:
         try:
             pretty = json.dumps(_cbor_to_display(loads(data[1:])), indent=2)
-            print(f"CTAP {direction}: {name}:")
-            print("\n".join("  " + line for line in pretty.splitlines()))
+            logging.info("CTAP %s: %s:\n%s", direction, name,
+                         "\n".join("  " + line for line in pretty.splitlines()))
         except Exception as exc:
-            print(f"  <CBOR decode failed: {exc}>")
+            logging.warning("CTAP %s: %s: <CBOR decode failed: %s>", direction, name, exc)
 
 
 def dispatch_ctap(request: bytes) -> bytes:
@@ -443,10 +443,10 @@ def dispatch_ctap(request: bytes) -> bytes:
         try:
             return usb_device.call(CTAPHID.CBOR, request)
         except CtapError as exc:
-            print(f"  USB device error: {exc}")
+            logging.error("USB device error: %s", exc)
             return bytes([exc.code])
         except OSError as exc:
-            print(f"  USB device I/O error: {exc}")
+            logging.error("USB device I/O error: %s", exc)
             return bytes([CTAP_ERR_NOT_ALLOWED])
 
     if not request:
@@ -461,7 +461,7 @@ def dispatch_ctap(request: bytes) -> bytes:
         return handle_make_credential(body)
     if cmd == CTAP_SELECTION:
         return handle_selection()
-    print(f"  Unknown CTAP command 0x{cmd:02x}")
+    logging.warning("Unknown CTAP command 0x%02x", cmd)
     return bytes([CTAP_ERR_INVALID_COMMAND])
 
 
@@ -485,16 +485,16 @@ async def _dispatch_ctap_async(payload: bytes) -> bytes:
         try:
             return await remote_usb_relay.call(payload)
         except Exception as exc:
-            print(f"  Remote USB relay error: {exc}")
+            logging.error("Remote USB relay error: %s", exc)
             return bytes([CTAP_ERR_NOT_ALLOWED])
     if args.remote_usb:
-        print("  No USB relay client connected.")
+        logging.error("No USB relay client connected.")
         return bytes([CTAP_ERR_NOT_ALLOWED])
     return dispatch_ctap(payload)
 
 
 async def handler(websocket):
-    print(f"Connection from path: {websocket.request.path}")
+    logging.info("Connection from path: %s", websocket.request.path)
 
     # Build a fresh handshake state for this connection.
     # The client's static key (from the QR) is pre-shared (KNpsk0 prologue).
@@ -507,18 +507,16 @@ async def handler(websocket):
 
     # -> psk, e  (initiator's first message)
     msg1 = await websocket.recv()
-    if args.verbose:
-        print(f"Received handshake msg1 ({len(msg1)} bytes): {msg1.hex()}")
+    logging.debug("Received handshake msg1 (%d bytes): %s", len(msg1), msg1.hex())
     hs.read_message(msg1)
 
     # <- e, ee, se  (responder's reply)
     msg2 = hs.write_message()
-    if args.verbose:
-        print(f"Sending handshake msg2 ({len(msg2)} bytes): {msg2.hex()}")
+    logging.debug("Sending handshake msg2 (%d bytes): %s", len(msg2), msg2.hex())
     await websocket.send(msg2)
 
     result = hs.finish()
-    print("Noise handshake complete.")
+    logging.info("Noise handshake complete.")
 
     send_cipher    = result.send_cipher
     receive_cipher = result.receive_cipher
@@ -536,8 +534,7 @@ async def handler(websocket):
     info_cbor = info_response[1:]
     post_handshake = dumps({1: info_cbor}, canonical=True)
     await websocket.send(_channel_encrypt(send_cipher, post_handshake))
-    if args.verbose:
-        print("Sent post-handshake cached getInfo.")
+    logging.debug("Sent post-handshake cached getInfo.")
 
     # CTAP request/response loop.
     # Each frame: decrypt -> unpad -> [type_byte(0x01)] || ctap_request
@@ -546,28 +543,28 @@ async def handler(websocket):
         try:
             raw = await websocket.recv()
         except Exception as exc:
-            print(f"Connection closed: {exc}")
+            logging.info("Connection closed: %s", exc)
             break
 
         try:
             plaintext = _channel_decrypt(receive_cipher, raw)
         except Exception as exc:
-            print(f"Decryption failed: {exc}")
+            logging.error("Decryption failed: %s", exc)
             break
 
         if not plaintext:
-            print("Empty frame -- ignoring")
+            logging.warning("Empty frame -- ignoring")
             continue
 
         frame_type = plaintext[0]
         payload    = plaintext[1:]
 
         if frame_type == CTAP_FRAME_SHUTDOWN:
-            print("Client sent Shutdown frame -- closing.")
+            logging.info("Client sent Shutdown frame -- closing.")
             break
 
         if frame_type != CTAP_FRAME_CTAP:
-            print(f"Unexpected frame type 0x{frame_type:02x} -- ignoring")
+            logging.warning("Unexpected frame type 0x%02x -- ignoring", frame_type)
             continue
 
         _log_ctap_message("request", payload, CTAP_COMMAND_NAMES)
@@ -577,20 +574,20 @@ async def handler(websocket):
         response_frame = bytes([CTAP_FRAME_CTAP]) + ctap_response
         await websocket.send(_channel_encrypt(send_cipher, response_frame))
 
-    print("Session complete -- exiting.")
+    logging.info("Session complete -- exiting.")
     mainloop.quit()
 
 
 async def usb_relay_handler(websocket):
     global remote_usb_relay
-    print(f"USB relay client connected from {websocket.remote_address}")
+    logging.info("USB relay client connected from %s", websocket.remote_address)
     remote_usb_relay = RemoteUsbRelay(websocket)
     relay_connected_event.set()
     try:
         await websocket.wait_closed()
     finally:
         remote_usb_relay = None
-        print("USB relay client disconnected.")
+        logging.info("USB relay client disconnected.")
 
 
 async def connection_handler(websocket):
@@ -615,10 +612,9 @@ def _finalize_ble_advert_data(routing_id, tunnel_service_id):
     eid_plaintext = flags + nonce + routingID + tunnel_serviceID
     serviceData = encrypt_eid(eidKey, eid_plaintext)
     psk = derive(qrSecret, salt=eid_plaintext, purpose=keyPurposePSK, length=32)
-    if args.verbose:
-        print(f"EID plaintext: {eid_plaintext.hex()}")
-        print(f"EID encrypted: {serviceData.hex()}")
-        print(f"PSK: {psk.hex()}")
+    logging.debug("EID plaintext: %s", eid_plaintext.hex())
+    logging.debug("EID encrypted: %s", serviceData.hex())
+    logging.debug("PSK: %s", psk.hex())
     ble_data_ready.set()
 
 
@@ -644,16 +640,14 @@ async def main():
             domain, tunnel_service_id = TUNNEL_REGISTRARS[args.tunnel_server]
             tunnel_id = derive(qrSecret, purpose=keyPurposeTunnelID)[:16]
             url = f"wss://{domain}/cable/new/{tunnel_id.hex()}"
-            print(f"Registering tunnel with {domain}")
-            if args.verbose:
-                print(f"  URL: {url}")
+            logging.info("Registering tunnel with %s", domain)
+            logging.debug("  URL: %s", url)
             async with websockets.connect(
                 url, subprotocols=["fido.cable"],
                 additional_headers={"Origin": f"wss://{domain}"},
             ) as websocket:
                 routing_id = bytes.fromhex(websocket.response.headers["X-caBLE-Routing-ID"])
-                if args.verbose:
-                    print(f"Routing ID from {domain}: {routing_id.hex()}")
+                logging.debug("Routing ID from %s: %s", domain, routing_id.hex())
                 _finalize_ble_advert_data(routing_id, tunnel_service_id)
 
                 if args.remote_usb:
@@ -668,7 +662,7 @@ async def main():
                                  subprotocols=["fido.cable"], ssl=_load_ssl_context())
             await server.wait_closed()
     except Exception as exc:
-        print(f"Fatal error setting up tunnel server: {exc!r}")
+        logging.error("Fatal error setting up tunnel server: %r", exc)
         os._exit(1)
 
 
@@ -697,10 +691,13 @@ arg_parser.add_argument('--tunnel-server', choices=['self', 'google', 'local'], 
                              "'self' hosts our own WSS tunnel endpoint directly. The "
                              "'google' option relies on undocumented infrastructure that "
                              "could change or break.")
-arg_parser.add_argument('--verbose', action='store_true',
-                        help="Log raw CTAP messages (hex + decoded CBOR) and detailed "
-                             "tunnel establishment messages (handshake bytes, key material)")
+arg_parser.add_argument('--log-level', default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        help="Set logging verbosity (default: INFO); DEBUG additionally shows "
+                             "raw CTAP hex bytes, handshake bytes, and key material")
 args = arg_parser.parse_args()
+
+logging.basicConfig(level=getattr(logging, args.log_level), format='%(levelname)s: %(message)s')
 
 if args.usb and args.remote_usb:
     arg_parser.error("--usb and --remote-usb are mutually exclusive")
@@ -709,7 +706,7 @@ if args.usb and args.remote_usb:
 # endpoint) requires root. BLE advertising via D-Bus may also need root
 # unless a polkit policy grants the current user access to org.bluez.
 if (args.tunnel_server == 'self' or args.remote_usb) and os.getuid() != 0:
-    print("Need root to bind port 443 (--tunnel-server self or --remote-usb).")
+    logging.error("Need root to bind port 443 (--tunnel-server self or --remote-usb).")
     sys.exit(1)
 
 fido_uri = args.fido_uri
@@ -721,40 +718,35 @@ if args.remote_usb:
     relay_token = args.relay_token or secrets.token_urlsafe(24)
 
 decoded = fido_decode(fido_uri)
-if args.verbose:
-    print(f"Decoded FIDO URI: {decoded}")
+logging.debug("Decoded FIDO URI: %s", decoded)
 
 try:
     compressed_pubkey = decoded[0]  # 33-byte compressed P-256 public key
-    if args.verbose:
-        print(f"Client static pubkey (compressed):   {compressed_pubkey.hex()}")
+    logging.debug("Client static pubkey (compressed):   %s", compressed_pubkey.hex())
 
     # Decompress to 65-byte uncompressed form -- required for DH and the
     # caBLE Noise prologue (which mixes the uncompressed encoding).
     client_pubkey_obj = deserialize_public_key_compressed(compressed_pubkey)
     client_pubkey_uncompressed = serialize_public_key(client_pubkey_obj)
-    if args.verbose:
-        print(f"Client static pubkey (uncompressed): {client_pubkey_uncompressed.hex()}")
+    logging.debug("Client static pubkey (uncompressed): %s", client_pubkey_uncompressed.hex())
 
     qrSecret = decoded[1]  # 16-byte QR secret
-    if args.verbose:
-        print(f"QR secret: {qrSecret.hex()}")
+    logging.debug("QR secret: %s", qrSecret.hex())
 
     timestamp = decoded[3]
-    print(f"Timestamp: {datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info("Timestamp: %s", datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'))
 
     cmd = decoded[5]  # 'ga' or 'mc'
-    print(f"Request type: {cmd}")
+    logging.info("Request type: %s", cmd)
     # Both 'ga' and 'mc' are handled at the CTAP dispatch layer -- no assertion here.
 
 except KeyError as exc:
-    print(f"Missing required FIDO URI field: {exc}")
+    logging.error("Missing required FIDO URI field: %s", exc)
     sys.exit(1)
 
 # Derive EID key and construct BLE advertisement plaintext.
 eidKey = derive(qrSecret, purpose=keyPurposeEIDKey)
-if args.verbose:
-    print(f"EID key: {eidKey.hex()}")
+logging.debug("EID key: %s", eidKey.hex())
 
 flags = b'\x00'
 nonce = secrets.token_bytes(10)
@@ -769,13 +761,13 @@ nonce = secrets.token_bytes(10)
 # Start WebSocket tunnel server / Google tunnel registration in a background thread.
 threading.Thread(target=run_asyncio, daemon=True).start()
 
-print("Waiting for tunnel setup...")
+logging.info("Waiting for tunnel setup...")
 ble_data_ready.wait()
 
 if args.remote_usb:
     relay_url = f"wss://cable.pyzci7hxyjsvc.org/usb-relay/{relay_token}"
-    print("Waiting for USB relay client to connect:")
-    print(f"  python client/main.py usb-relay --server {relay_url}")
+    logging.info("Waiting for USB relay client to connect:")
+    logging.info("  python client/main.py usb-relay --server %s", relay_url)
     relay_connected_event.wait()
 
 ### BLE advertising ###
@@ -784,7 +776,7 @@ dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 bus = dbus.SystemBus()
 
 adapter_path = BLUEZ_NAMESPACE + ADAPTER_NAME
-print(f"BLE adapter: {adapter_path}")
+logging.info("BLE adapter: %s", adapter_path)
 adv_mgr_interface = dbus.Interface(
     bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
     ADVERTISING_MANAGER_INTERFACE,
@@ -798,5 +790,5 @@ try:
     mainloop = GLib.MainLoop()
     mainloop.run()
 except KeyboardInterrupt:
-    print("Shutting down...")
+    logging.info("Shutting down...")
     mainloop.quit()
