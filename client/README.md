@@ -61,6 +61,20 @@ This is intended for testing individual CTAP commands. For persistent connection
 - `usb-relay` - Relay CTAP commands to a local USB security key for a remote authenticator
 - `stdio-relay` - Relay CTAP frames over file descriptors 3/4 for external processes like [sk-hybrid.so](https://github.com/joostd/openssh-hybrid-sk-provider)
 
+### stdio-relay Mode
+
+The `stdio-relay` command enables external processes (like [sk-hybrid.so](https://github.com/joostd/openssh-hybrid-sk-provider)) to use the caBLE transport by reading/writing length-prefixed CTAP frames over pipes:
+
+- External process writes CTAP request frames to fd 3
+- External process reads CTAP response frames from fd 4
+- Wire format: `[4-byte big-endian length][CTAP frame bytes]`
+- Request frames: `[0x01 CTAP_FRAME_CTAP][CTAP cmd byte][CBOR params...]`
+- Response frames: `[CTAP status byte][CBOR body...]`
+
+This allows sk-hybrid.so to delegate all BLE scanning, QR display, tunnel connection, and Noise encryption to this Python client while handling only CTAP framing in C.
+
+The client displays the QR code and BLE scan output on the terminal (fds 0/1/2) while CTAP frames are exchanged on fds 3/4, so the user can see connection status while the external process communicates with the authenticator.
+
 ## Options
 
 - `--rp-id <domain>` - Relying party identifier (default: example.com)
