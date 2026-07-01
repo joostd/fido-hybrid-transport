@@ -287,7 +287,7 @@ def handle_get_info():
         # pinUvAuthProtocol/clientPin. Without it, Chrome skips getAssertion
         # for requests with userVerification: required.
         4: {'rk': True, 'up': True, 'uv': True},
-        5: 1024,
+        #5: 1024,
         9: ['hybrid'],
     }
     return bytes([CTAP_STATUS_OK]) + dumps(info, canonical=True)
@@ -406,19 +406,36 @@ class RemoteUsbRelay:
             return await self.websocket.recv()
 
 
+def _cbor_to_display(obj):
+    """Recursively convert CBOR-decoded objects to JSON-serialisable form."""
+    if isinstance(obj, (bytes, bytearray)):
+        h = obj.hex()
+        return h[:128] + f"...({len(obj)}B)" if len(h) > 128 else h
+    if isinstance(obj, dict):
+        return {str(k): _cbor_to_display(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_cbor_to_display(v) for v in obj]
+    return obj
+
+
 def _log_ctap_message(direction: str, data: bytes, names: dict) -> None:
     """Log a raw CTAP request/response: hex bytes plus decoded CBOR body."""
+    if direction == 'request':
+        print(64*"-")
     if not data:
         print(f"CTAP {direction}: (empty)")
         return
     code = data[0]
     name = names.get(code, f"0x{code:02x}")
-    print(f"CTAP {direction}: {name} ({len(data)} bytes): {data.hex()}")
+    if args.verbose:
+        print(f"CTAP {direction}: {name} ({len(data)} bytes): {data.hex()}")
     if len(data) > 1:
         try:
-            print(f"  decoded: {loads(data[1:])!r}")
+            pretty = json.dumps(_cbor_to_display(loads(data[1:])), indent=2)
+            print(f"CTAP {direction}: {name}:")
+            print("\n".join("  " + line for line in pretty.splitlines()))
         except Exception as exc:
-            print(f"  decoded: <CBOR decode failed: {exc}>")
+            print(f"  <CBOR decode failed: {exc}>")
 
 
 def dispatch_ctap(request: bytes) -> bytes:
@@ -490,12 +507,14 @@ async def handler(websocket):
 
     # -> psk, e  (initiator's first message)
     msg1 = await websocket.recv()
-    print(f"Received handshake msg1 ({len(msg1)} bytes): {msg1.hex()}")
+    if args.verbose:
+        print(f"Received handshake msg1 ({len(msg1)} bytes): {msg1.hex()}")
     hs.read_message(msg1)
 
     # <- e, ee, se  (responder's reply)
     msg2 = hs.write_message()
-    print(f"Sending handshake msg2 ({len(msg2)} bytes): {msg2.hex()}")
+    if args.verbose:
+        print(f"Sending handshake msg2 ({len(msg2)} bytes): {msg2.hex()}")
     await websocket.send(msg2)
 
     result = hs.finish()
@@ -517,7 +536,8 @@ async def handler(websocket):
     info_cbor = info_response[1:]
     post_handshake = dumps({1: info_cbor}, canonical=True)
     await websocket.send(_channel_encrypt(send_cipher, post_handshake))
-    print("Sent post-handshake cached getInfo.")
+    if args.verbose:
+        print("Sent post-handshake cached getInfo.")
 
     # CTAP request/response loop.
     # Each frame: decrypt -> unpad -> [type_byte(0x01)] || ctap_request
@@ -593,11 +613,12 @@ def _finalize_ble_advert_data(routing_id, tunnel_service_id):
     routingID = routing_id
     tunnel_serviceID = tunnel_service_id
     eid_plaintext = flags + nonce + routingID + tunnel_serviceID
-    print(f"EID plaintext: {eid_plaintext.hex()}")
     serviceData = encrypt_eid(eidKey, eid_plaintext)
-    print(f"EID encrypted: {serviceData.hex()}")
     psk = derive(qrSecret, salt=eid_plaintext, purpose=keyPurposePSK, length=32)
-    print(f"PSK: {psk.hex()}")
+    if args.verbose:
+        print(f"EID plaintext: {eid_plaintext.hex()}")
+        print(f"EID encrypted: {serviceData.hex()}")
+        print(f"PSK: {psk.hex()}")
     ble_data_ready.set()
 
 
@@ -623,13 +644,16 @@ async def main():
             domain, tunnel_service_id = TUNNEL_REGISTRARS[args.tunnel_server]
             tunnel_id = derive(qrSecret, purpose=keyPurposeTunnelID)[:16]
             url = f"wss://{domain}/cable/new/{tunnel_id.hex()}"
-            print(f"Registering tunnel with {domain}: {url}")
+            print(f"Registering tunnel with {domain}")
+            if args.verbose:
+                print(f"  URL: {url}")
             async with websockets.connect(
                 url, subprotocols=["fido.cable"],
                 additional_headers={"Origin": f"wss://{domain}"},
             ) as websocket:
                 routing_id = bytes.fromhex(websocket.response.headers["X-caBLE-Routing-ID"])
-                print(f"Routing ID from {domain}: {routing_id.hex()}")
+                if args.verbose:
+                    print(f"Routing ID from {domain}: {routing_id.hex()}")
                 _finalize_ble_advert_data(routing_id, tunnel_service_id)
 
                 if args.remote_usb:
@@ -673,6 +697,9 @@ arg_parser.add_argument('--tunnel-server', choices=['self', 'google', 'local'], 
                              "'self' hosts our own WSS tunnel endpoint directly. The "
                              "'google' option relies on undocumented infrastructure that "
                              "could change or break.")
+arg_parser.add_argument('--verbose', action='store_true',
+                        help="Log raw CTAP messages (hex + decoded CBOR) and detailed "
+                             "tunnel establishment messages (handshake bytes, key material)")
 args = arg_parser.parse_args()
 
 if args.usb and args.remote_usb:
@@ -694,20 +721,24 @@ if args.remote_usb:
     relay_token = args.relay_token or secrets.token_urlsafe(24)
 
 decoded = fido_decode(fido_uri)
-print(f"Decoded FIDO URI: {decoded}")
+if args.verbose:
+    print(f"Decoded FIDO URI: {decoded}")
 
 try:
     compressed_pubkey = decoded[0]  # 33-byte compressed P-256 public key
-    print(f"Client static pubkey (compressed):   {compressed_pubkey.hex()}")
+    if args.verbose:
+        print(f"Client static pubkey (compressed):   {compressed_pubkey.hex()}")
 
     # Decompress to 65-byte uncompressed form -- required for DH and the
     # caBLE Noise prologue (which mixes the uncompressed encoding).
     client_pubkey_obj = deserialize_public_key_compressed(compressed_pubkey)
     client_pubkey_uncompressed = serialize_public_key(client_pubkey_obj)
-    print(f"Client static pubkey (uncompressed): {client_pubkey_uncompressed.hex()}")
+    if args.verbose:
+        print(f"Client static pubkey (uncompressed): {client_pubkey_uncompressed.hex()}")
 
     qrSecret = decoded[1]  # 16-byte QR secret
-    print(f"QR secret: {qrSecret.hex()}")
+    if args.verbose:
+        print(f"QR secret: {qrSecret.hex()}")
 
     timestamp = decoded[3]
     print(f"Timestamp: {datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')}")
@@ -722,7 +753,8 @@ except KeyError as exc:
 
 # Derive EID key and construct BLE advertisement plaintext.
 eidKey = derive(qrSecret, purpose=keyPurposeEIDKey)
-print(f"EID key: {eidKey.hex()}")
+if args.verbose:
+    print(f"EID key: {eidKey.hex()}")
 
 flags = b'\x00'
 nonce = secrets.token_bytes(10)
