@@ -34,9 +34,29 @@ _parser.add_argument('command', nargs='?',
                      choices=['get-info', 'make-credential', 'get-assertion', 'usb-relay', 'stdio-relay'],
                      default='get-info')
 _parser.add_argument('--rp-id', default='example.com')
+_parser.add_argument('--user-id', help="User ID in hex for make-credential (default: user-name)")
+_parser.add_argument('--user-name', help="User name for make-credential (required for make-credential)")
+_parser.add_argument('--display-name', help="User display name for make-credential (default: same as --user-name)")
 _parser.add_argument('--server', help="wss://.../usb-relay/<token> URL (for usb-relay)")
 _parser.add_argument('--hint', choices=['mc', 'ga'], help="FIDO URI command hint (mc=makeCredential, ga=getAssertion)")
 args = _parser.parse_args()
+
+# Validate and set defaults for make-credential
+if args.command == 'make-credential':
+    if args.user_name is None:
+        _parser.error("make-credential requires --user-name")
+
+    # Default display-name to user-name if not specified
+    if args.display_name is None:
+        args.display_name = args.user_name
+
+    # Default user-id to user-name if not specified
+    if args.user_id is None:
+        args.user_id = args.user_name
+else:
+    # For other commands, set defaults if needed
+    if args.display_name is None and args.user_name is not None:
+        args.display_name = args.user_name
 
 def _call_usb_device(usb_device, request):
     # ConnectionFailure("Wrong channel") is a transient hiccup seen on macOS,
@@ -219,6 +239,25 @@ def _handle_update_message(payload, handshake_hash, tunnel_server_domain):
     print(f"Linking info received and verified for {auth_name!r} -- saved to {LINKED_AUTHENTICATORS_PATH}")
 
 
+def _drain_update_frames(websocket, receive_cipher, handshake_hash, tunnel_server_domain, timeout=0.5):
+    """Read and handle any pending UPDATE frames from the authenticator.
+    Used after the post-handshake message to consume linking-info frames
+    that iOS sends when state-assisted transactions are advertised in the QR."""
+    while True:
+        try:
+            raw = websocket.recv(timeout=timeout)
+            resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
+            frame_type, body = resp[0], resp[1:]
+            if frame_type == CTAP_FRAME_UPDATE:
+                _handle_update_message(body, handshake_hash, tunnel_server_domain)
+                continue
+            # Got a non-UPDATE frame - shouldn't happen, but stop draining
+            break
+        except Exception:
+            # Timeout or other error means no more frames to read
+            break
+
+
 def _send_ctap_and_recv(websocket, send_cipher, receive_cipher, ctap_payload, handshake_hash, tunnel_server_domain):
     """Send a CTAP request frame and read frames until the CTAP response,
     handling any interleaved update (linking info) messages along the way."""
@@ -315,20 +354,29 @@ if __name__ == "__main__":
             # Post-handshake: server sends {1: cbor_info_bytes} immediately after handshake.
             raw = websocket.recv(timeout=10)
             post_hs = loads(unpad_message(receive_cipher.decrypt_with_ad(b"", raw)))
-            print(f"Post-handshake cached getInfo: {post_hs}")
+            # The post-handshake message contains {1: raw_cbor_encoded_info_map}
+            cached_info = loads(post_hs[1])
 
             if args.command == 'get-info':
-                body = _send_ctap_and_recv(websocket, send_cipher, receive_cipher, bytes([0x04]), handshake_hash, tunnelServerDomain)
-                status = body[0]
-                print(f"CTAP getInfo response: status=0x{status:02x}, info={loads(body[1:])}")
+                # Use the cached getInfo from the post-handshake message instead of
+                # sending a redundant request. iOS does not respond to the redundant
+                # getInfo, and the spec already provides this information.
+                print(f"authenticatorGetInfo: {cached_info}")
 
             elif args.command == 'make-credential':
                 client_data_hash = secrets.token_bytes(32)
+                # Decode user_id from hex if it looks like hex, otherwise encode as UTF-8
+                try:
+                    user_id_bytes = bytes.fromhex(args.user_id)
+                except ValueError:
+                    user_id_bytes = args.user_id.encode('utf-8')
+
                 mc_req = dumps({
                     1: client_data_hash,
                     2: {'id': args.rp_id, 'name': args.rp_id},
-                    3: {'id': b'user01', 'name': 'Test User'},
+                    3: {'id': user_id_bytes, 'name': args.user_name, 'displayName': args.display_name},
                     4: [{'type': 'public-key', 'alg': -7}],
+                    7: {'rk': True, 'uv': True},
                 }, canonical=True)
                 body = _send_ctap_and_recv(websocket, send_cipher, receive_cipher, bytes([0x01]) + mc_req, handshake_hash, tunnelServerDomain)
                 status = body[0]
@@ -374,6 +422,10 @@ if __name__ == "__main__":
                 # fds 0/1/2 stay attached to the real terminal throughout (the QR
                 # code, BLE scan output, and tunnel status printed above remain
                 # visible to the user who needs to scan with their phone).
+
+                # Drain any UPDATE frames that may have been sent after post-handshake
+                _drain_update_frames(websocket, receive_cipher, handshake_hash, tunnelServerDomain, timeout=0.5)
+
                 import sys as _sys
                 relay_in  = os.fdopen(3, 'rb')
                 relay_out = os.fdopen(4, 'wb')
