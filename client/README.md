@@ -28,7 +28,8 @@ uv sync
 
 ```bash
 python main.py                                    # get-info (default)
-python main.py make-credential --rp-id example.com
+python main.py make-credential --rp-id example.com --user-name "Alice Smith"
+python main.py make-credential --rp-id example.com --user-id 0123456789abcdef --user-name "Alice"
 python main.py get-assertion --rp-id example.com
 python main.py usb-relay --server wss://example.com/usb-relay/<token>
 python main.py stdio-relay --hint mc             # for OpenSSH sk-hybrid.so
@@ -63,6 +64,9 @@ This is intended for testing individual CTAP commands. For persistent connection
 ## Options
 
 - `--rp-id <domain>` - Relying party identifier (default: example.com)
+- `--user-id <hex>` - User ID in hex for make-credential (default: user-name as UTF-8)
+- `--user-name <name>` - User name for make-credential (required for make-credential)
+- `--display-name <name>` - User display name for make-credential (default: same as --user-name)
 - `--hint <mc|ga>` - FIDO URI command hint (mc=makeCredential, ga=getAssertion)
 - `--server <url>` - WebSocket server URL (for usb-relay mode)
 
