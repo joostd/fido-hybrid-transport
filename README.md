@@ -1,6 +1,7 @@
 # fido-hybrid-transport
 
 FIDO2/WebAuthn hybrid transport (caBLE) implementation in Python for testing, development, and integration.
+See the CTAP 2.3 spec on [Hybrid transports](https://fidoalliance.org/specs/fido-v2.3-ps-20260226/fido-client-to-authenticator-protocol-v2.3-ps-20260226.html#sctn-hybrid) for details.
 
 ## Overview
 
