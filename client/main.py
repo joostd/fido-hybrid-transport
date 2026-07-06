@@ -395,9 +395,6 @@ if __name__ == "__main__":
     logging.info("Scanning...")
     while True:
         cableData = asyncio.run(scan())
-
-
-        #cableData = bytes.fromhex('f3bd42594d32f8b0dcbcf5e0302a9cfbec5f2a82')
         assert(len(cableData) == 20)
         logging.debug(f"BLE advert encrypted ({len(cableData)} bytes): {cableData.hex()}")
         logging.info(f"encrypted BLE advert: {cableData.hex()}")
@@ -475,6 +472,9 @@ if __name__ == "__main__":
             logging.debug(f"RECV Post-handshake raw ({len(raw)} bytes): {raw.hex()}")
             post_hs = loads(unpad_message(receive_cipher.decrypt_with_ad(b"", raw)))
             logging.debug(f"Post-handshake decrypted: {post_hs}")
+            # array of strings representing supported features:
+            features = post_hs.get(3, ['ctap'])
+            logging.info(f"Post-handshake cached features: {features}")
             # The post-handshake message contains {1: raw_cbor_encoded_info_map}
             cached_info = loads(post_hs[1])
             logging.info(f"Post-handshake cached getInfo: {cached_info}")
