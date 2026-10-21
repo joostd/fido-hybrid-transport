@@ -133,6 +133,10 @@ _parser.add_argument('--user-id', help="User ID in hex for make-credential (defa
 _parser.add_argument('--user-name', help="User name for make-credential (required for make-credential)")
 _parser.add_argument('--display-name', help="User display name for make-credential (default: same as --user-name)")
 _parser.add_argument('--server', help="wss://.../usb-relay/<token> URL (for usb-relay)")
+_parser.add_argument('--ble', action='store_true',
+                     help="use the BLE L2CAP data transport instead of a tunnel "
+                          "server, so the authenticator needs no internet access "
+                          "(macOS only; requires authenticator support)")
 _parser.add_argument('--hint', choices=['mc', 'ga'], help="FIDO URI command hint (mc=makeCredential, ga=getAssertion)")
 _parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO',
                      help="Logging level (DEBUG shows all raw CTAP messages and tunnel establishment)")
@@ -200,12 +204,20 @@ if args.command == 'usb-relay':
 def fido_encode(data):
   # CBOR-encode input dict
   cbor_data = dumps(data)
-  # group in chuncks of 7 bytes
+  # Seven-byte chunks are little-endian values encoded as 17-digit decimals.
+  # A trailing partial chunk is encoded likewise, in the minimum number of
+  # digits that some value of that length could need: 3, 5, 8, 10, 13 or 15
+  # digits for 1..6 bytes. The decoder relies on these fixed widths, so every
+  # chunk -- including the last -- must be zero-padded to its width.
+  #   https://fidoalliance.org/specs/hybrid/proximity-exchange-protocol-v1.0-wd-20260717.html
+  PARTIAL_CHUNK_DIGITS = 0x0fda8530
   n = 7
-  chunks = [cbor_data[i:i + n][::-1] for i in range(0, len(cbor_data), n)]
-  # convert chunks to decimals
-  decimals = [ str(int.from_bytes(b)) for b in chunks ]
-  return "".join( [ i.rjust(17,"0") for i in decimals[:-1]] + [ decimals[-1] ] )
+  out = []
+  for i in range(0, len(cbor_data), n):
+    chunk = cbor_data[i:i + n]
+    width = 17 if len(chunk) == n else (PARTIAL_CHUNK_DIGITS >> (4 * len(chunk))) & 15
+    out.append(str(int.from_bytes(chunk, "little")).rjust(width, "0"))
+  return "".join(out)
 
 qrSecret = secrets.token_bytes(16)
 private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
@@ -226,6 +238,11 @@ authenticatorData = {
   4: True,  # this client can perform state-assisted transactions (sctn-hybrid-state-assisted)
   5: args.hint if args.hint else ('mc' if args.command == 'make-credential' else 'ga')
 }
+if args.ble:
+  # Key 6: transport channels this client supports. 0 = websocket tunnel,
+  # 1 = BLE L2CAP. Absent means tunnel only, which is the default so that
+  # authenticators without L2CAP support are unaffected.
+  authenticatorData[6] = [0, 1]
 fido = fido_encode(authenticatorData)
 
 logging.info("FIDO:/" + fido)
@@ -392,8 +409,17 @@ if __name__ == "__main__":
     logging.debug(f"Key: {eidKey.hex()}")
 
     payload = None
-    logging.info("Scanning...")
-    while True:
+    ble_connection = None
+    if args.ble:
+        import ble_transport
+        payload, ble_connection = ble_transport.discover_and_connect(
+            lambda advert: trialDecrypt(eidKey, advert)
+        )
+        logging.info(f"Decrypted: {payload.hex()}")
+
+    if ble_connection is None:
+        logging.info("Scanning...")
+    while ble_connection is None:
         cableData = asyncio.run(scan())
         assert(len(cableData) == 20)
         logging.debug(f"BLE advert encrypted ({len(cableData)} bytes): {cableData.hex()}")
@@ -417,23 +443,33 @@ if __name__ == "__main__":
     logging.debug(f"nonce: {nonce.hex()}")
     logging.debug(f"routingID: {routingID.hex()}")
     logging.debug(f"tunnel_serviceID: {tunnel_serviceID.hex()}")
-    encodedTunnelServerDomain = tunnel_serviceID[0] + (tunnel_serviceID[1] << 8)
-    # Values zero through 255 are assigned, and values >= 256 are translated into a domain name by hashing.
-    assert(encodedTunnelServerDomain >= 0 and (encodedTunnelServerDomain < len(assignedTunnelServerDomains) or encodedTunnelServerDomain > 255))
-    if encodedTunnelServerDomain > 255:
-        tunnelServerDomain = 'cable.pyzci7hxyjsvc.org' # TODO hardcoding 0x0105 here, calculate domain name instead
+    if ble_connection is not None:
+        # BLE L2CAP: the data channel is the advertised PSM, so no tunnel
+        # server is contacted and the authenticator needs no internet access.
+        # The advert still carries a tunnel service id, but it is unused here.
+        tunnelServerDomain = None
+        transport_cm = ble_connection
     else:
-        tunnelServerDomain = assignedTunnelServerDomains[encodedTunnelServerDomain]
-    tunnelID = derive(secret=qrSecret, purpose=keyPurposeTunnelID)[:16]
+        encodedTunnelServerDomain = tunnel_serviceID[0] + (tunnel_serviceID[1] << 8)
+        # Values zero through 255 are assigned, and values >= 256 are translated into a domain name by hashing.
+        assert(encodedTunnelServerDomain >= 0 and (encodedTunnelServerDomain < len(assignedTunnelServerDomains) or encodedTunnelServerDomain > 255))
+        if encodedTunnelServerDomain > 255:
+            tunnelServerDomain = 'cable.pyzci7hxyjsvc.org' # TODO hardcoding 0x0105 here, calculate domain name instead
+        else:
+            tunnelServerDomain = assignedTunnelServerDomains[encodedTunnelServerDomain]
+        tunnelID = derive(secret=qrSecret, purpose=keyPurposeTunnelID)[:16]
 
-    connectURL = "wss://" + tunnelServerDomain + "/cable/connect/" + routingID.hex() + "/" + tunnelID.hex()
-    logging.debug(connectURL)
+        connectURL = "wss://" + tunnelServerDomain + "/cable/connect/" + routingID.hex() + "/" + tunnelID.hex()
+        logging.debug(connectURL)
 
-    with connect(connectURL, subprotocols=["fido.cable"],
-                  additional_headers={"Origin": f"wss://{tunnelServerDomain}"}) as websocket:
+        transport_cm = connect(connectURL, subprotocols=["fido.cable"],
+                               additional_headers={"Origin": f"wss://{tunnelServerDomain}"})
+
+    with transport_cm as websocket:
         try:
-            logging.debug(f"Tunnel connection established to {connectURL}")
-            logging.info(f"connected to {connectURL}")
+            transport_desc = "BLE L2CAP channel" if ble_connection is not None else connectURL
+            logging.debug(f"Connection established over {transport_desc}")
+            logging.info(f"connected to {transport_desc}")
 
             # PSK: salt is eid_plaintext (payload), not cableData (encrypted EID).
             # derive() is hardcoded to length=64; [:32] is safe because
