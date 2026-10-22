@@ -83,6 +83,39 @@ def _format_ctap_status(status):
     name = CTAP_STATUS_CODES.get(status, "UNKNOWN")
     return f"0x{status:02x} ({name})"
 
+# Set from --hex: show byte strings that would otherwise be abbreviated.
+_HEX_DUMP = False
+
+INLINE_BYTES_MAX = 32
+HEX_DUMP_WIDTH = 16
+
+def _hex_dump(data, indent):
+    """Offset / hex dump, indented to sit under the value it belongs to.
+
+    An ASCII column is only worth the width when the value really is text --
+    on a signature or a hash it is a column of dots that reads as if the
+    bytes meant something. So it is added only when every byte is printable."""
+    spaces = "  " * indent
+    show_text = all(0x20 <= b < 0x7f for b in data)
+    lines = []
+    for off in range(0, len(data), HEX_DUMP_WIDTH):
+        chunk = data[off:off + HEX_DUMP_WIDTH]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        if show_text:
+            text = chunk.decode("ascii")
+            hex_part = f"{hex_part:<{HEX_DUMP_WIDTH * 3 - 1}}  |{text}|"
+        lines.append(f"{spaces}  {off:08x}  {hex_part}")
+    return "\n".join(lines)
+
+def _format_bytes(data, indent):
+    """Short byte strings inline as hex; long ones abbreviated, or dumped
+    in full when --hex is given."""
+    if len(data) <= INLINE_BYTES_MAX:
+        return data.hex()
+    if not _HEX_DUMP:
+        return f"<{len(data)} bytes>"
+    return f"{len(data)} bytes\n" + _hex_dump(data, indent)
+
 def _pretty_format_cbor(obj, indent=0):
     """Pretty-print CBOR object with proper indentation."""
     spaces = "  " * indent
@@ -93,10 +126,7 @@ def _pretty_format_cbor(obj, indent=0):
             if isinstance(v, (dict, list)):
                 lines.append(f"{spaces}  {key_str}: {_pretty_format_cbor(v, indent + 1)}")
             elif isinstance(v, bytes):
-                if len(v) > 32:
-                    lines.append(f"{spaces}  {key_str}: <{len(v)} bytes>")
-                else:
-                    lines.append(f"{spaces}  {key_str}: {v.hex()}")
+                lines.append(f"{spaces}  {key_str}: {_format_bytes(v, indent + 1)}")
             else:
                 lines.append(f"{spaces}  {key_str}: {v}")
         lines.append(f"{spaces}}}")
@@ -109,18 +139,15 @@ def _pretty_format_cbor(obj, indent=0):
             if isinstance(item, (dict, list)):
                 lines.append(f"{spaces}  {_pretty_format_cbor(item, indent + 1)},")
             elif isinstance(item, bytes):
-                if len(item) > 32:
-                    lines.append(f"{spaces}  <{len(item)} bytes>,")
-                else:
-                    lines.append(f"{spaces}  {item.hex()},")
+                rendered = _format_bytes(item, indent + 1)
+                # A dump ends on a hex row, where a trailing comma reads as data.
+                lines.append(f"{spaces}  {rendered}" + ("" if "\n" in rendered else ","))
             else:
                 lines.append(f"{spaces}  {item},")
         lines.append(f"{spaces}]")
         return "\n".join(lines)
     elif isinstance(obj, bytes):
-        if len(obj) > 32:
-            return f"<{len(obj)} bytes>"
-        return obj.hex()
+        return _format_bytes(obj, indent)
     else:
         return str(obj)
 
@@ -140,7 +167,12 @@ _parser.add_argument('--ble', action='store_true',
 _parser.add_argument('--hint', choices=['mc', 'ga'], help="FIDO URI command hint (mc=makeCredential, ga=getAssertion)")
 _parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO',
                      help="Logging level (DEBUG shows all raw CTAP messages and tunnel establishment)")
+_parser.add_argument('--hex', action='store_true',
+                     help=f"hex dump byte strings longer than {INLINE_BYTES_MAX} bytes "
+                          f"instead of abbreviating them as <N bytes>")
 args = _parser.parse_args()
+
+_HEX_DUMP = args.hex
 
 # Configure logging
 logging.basicConfig(
