@@ -288,6 +288,11 @@ CTAP_FRAME_SHUTDOWN = 0x00
 CTAP_FRAME_CTAP     = 0x01
 CTAP_FRAME_UPDATE   = 0x02
 
+# How long to wait for a CTAP response.  This covers the whole user
+# interaction on the authenticator -- picking a credential and passing user
+# verification -- so it has to be generous rather than a network timeout.
+CTAP_RESPONSE_TIMEOUT = 120
+
 # Linking info (CTAP 2.3 sctn-hybrid-state-assisted), keyed by the
 # authenticator's public key so repeat links from the same authenticator
 # overwrite each other.
@@ -430,7 +435,8 @@ def _send_shutdown(websocket, send_cipher):
         logging.debug(f"could not send shutdown frame: {e}")
 
 
-def _send_ctap_and_recv(websocket, send_cipher, receive_cipher, ctap_payload, handshake_hash, tunnel_server_domain):
+def _send_ctap_and_recv(websocket, send_cipher, receive_cipher, ctap_payload, handshake_hash, tunnel_server_domain,
+                        timeout=CTAP_RESPONSE_TIMEOUT):
     """Send a CTAP request frame and read frames until the CTAP response,
     handling any interleaved update (linking info) messages along the way."""
     frame = bytes([CTAP_FRAME_CTAP]) + ctap_payload
@@ -439,7 +445,7 @@ def _send_ctap_and_recv(websocket, send_cipher, receive_cipher, ctap_payload, ha
     logging.debug(f"SEND CTAP encrypted ({len(encrypted)} bytes): {encrypted.hex()}")
     websocket.send(encrypted)
     while True:
-        raw = websocket.recv(timeout=10)
+        raw = websocket.recv(timeout=timeout)
         logging.debug(f"RECV encrypted frame ({len(raw)} bytes): {raw.hex()}")
         resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
         logging.debug(f"RECV decrypted frame ({len(resp)} bytes): {resp.hex()}")
@@ -683,7 +689,7 @@ if __name__ == "__main__":
                     max_attempts = 5  # Allow up to 5 non-CTAP frames before giving up
                     while attempts < max_attempts:
                         try:
-                            raw = websocket.recv(timeout=30)
+                            raw = websocket.recv(timeout=CTAP_RESPONSE_TIMEOUT)
                             logging.debug(f"RECV from tunnel encrypted ({len(raw)} bytes): {raw.hex()}")
                             resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
                             logging.debug(f"RECV from tunnel decrypted ({len(resp)} bytes): {resp.hex()}")
