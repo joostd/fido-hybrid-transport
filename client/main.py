@@ -380,6 +380,24 @@ def _drain_update_frames(websocket, receive_cipher, handshake_hash, tunnel_serve
             break
 
 
+def _send_shutdown(websocket, send_cipher):
+    """Tell the authenticator the session is over.
+
+    Without this the authenticator has no way to know we are done: it stays in
+    the session waiting for another command, keeping its UI up ("Connecting
+    with another device") until something times out.  Over a tunnel that is the
+    websocket close; over BLE there is no in-band signal at all, so the phone
+    waits for the L2CAP link to drop and reports UNEXPECTED_EOF.
+
+    Best effort -- if the peer already went away there is nothing to tell."""
+    try:
+        frame = bytes([CTAP_FRAME_SHUTDOWN])
+        websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(frame)))
+        logging.debug("SEND shutdown frame (type 0x00)")
+    except Exception as e:
+        logging.debug(f"could not send shutdown frame: {e}")
+
+
 def _send_ctap_and_recv(websocket, send_cipher, receive_cipher, ctap_payload, handshake_hash, tunnel_server_domain):
     """Send a CTAP request frame and read frames until the CTAP response,
     handling any interleaved update (linking info) messages along the way."""
@@ -464,6 +482,10 @@ if __name__ == "__main__":
 
         transport_cm = connect(connectURL, subprotocols=["fido.cable"],
                                additional_headers={"Origin": f"wss://{tunnelServerDomain}"})
+
+    # Set once the handshake completes; the teardown below needs to know
+    # whether there is a session to shut down at all.
+    send_cipher = receive_cipher = handshake_hash = None
 
     with transport_cm as websocket:
         try:
@@ -662,3 +684,11 @@ if __name__ == "__main__":
 
         except websockets.exceptions.ConnectionClosedOK as e:
             logging.info(f"Connection closed OK: {e}")
+        finally:
+            # End the session explicitly.  The authenticator may still have
+            # linking info queued behind the CTAP response, so read that out
+            # first -- an unread frame leaves it waiting just as a missing
+            # shutdown does.
+            if send_cipher is not None:
+                _drain_update_frames(websocket, receive_cipher, handshake_hash, tunnelServerDomain)
+                _send_shutdown(websocket, send_cipher)

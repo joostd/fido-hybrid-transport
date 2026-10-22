@@ -113,6 +113,10 @@ class BleL2capTransport:
         return self._read_exact(length, timeout)
 
     def close(self) -> None:
+        # `send()` only guarantees the bytes reached the OS, not the air.  The
+        # last thing written is usually the shutdown frame, and tearing the
+        # link down from under it would defeat the point of sending it.
+        _pump(0.3)
         for stream in (self._in, self._out):
             try:
                 stream.close()
