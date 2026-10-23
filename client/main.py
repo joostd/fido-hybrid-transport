@@ -83,6 +83,39 @@ def _format_ctap_status(status):
     name = CTAP_STATUS_CODES.get(status, "UNKNOWN")
     return f"0x{status:02x} ({name})"
 
+# Set from --hex: show byte strings that would otherwise be abbreviated.
+_HEX_DUMP = False
+
+INLINE_BYTES_MAX = 32
+HEX_DUMP_WIDTH = 16
+
+def _hex_dump(data, indent):
+    """Offset / hex dump, indented to sit under the value it belongs to.
+
+    An ASCII column is only worth the width when the value really is text --
+    on a signature or a hash it is a column of dots that reads as if the
+    bytes meant something. So it is added only when every byte is printable."""
+    spaces = "  " * indent
+    show_text = all(0x20 <= b < 0x7f for b in data)
+    lines = []
+    for off in range(0, len(data), HEX_DUMP_WIDTH):
+        chunk = data[off:off + HEX_DUMP_WIDTH]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        if show_text:
+            text = chunk.decode("ascii")
+            hex_part = f"{hex_part:<{HEX_DUMP_WIDTH * 3 - 1}}  |{text}|"
+        lines.append(f"{spaces}  {off:08x}  {hex_part}")
+    return "\n".join(lines)
+
+def _format_bytes(data, indent):
+    """Short byte strings inline as hex; long ones abbreviated, or dumped
+    in full when --hex is given."""
+    if len(data) <= INLINE_BYTES_MAX:
+        return data.hex()
+    if not _HEX_DUMP:
+        return f"<{len(data)} bytes>"
+    return f"{len(data)} bytes\n" + _hex_dump(data, indent)
+
 def _pretty_format_cbor(obj, indent=0):
     """Pretty-print CBOR object with proper indentation."""
     spaces = "  " * indent
@@ -93,10 +126,7 @@ def _pretty_format_cbor(obj, indent=0):
             if isinstance(v, (dict, list)):
                 lines.append(f"{spaces}  {key_str}: {_pretty_format_cbor(v, indent + 1)}")
             elif isinstance(v, bytes):
-                if len(v) > 32:
-                    lines.append(f"{spaces}  {key_str}: <{len(v)} bytes>")
-                else:
-                    lines.append(f"{spaces}  {key_str}: {v.hex()}")
+                lines.append(f"{spaces}  {key_str}: {_format_bytes(v, indent + 1)}")
             else:
                 lines.append(f"{spaces}  {key_str}: {v}")
         lines.append(f"{spaces}}}")
@@ -109,18 +139,15 @@ def _pretty_format_cbor(obj, indent=0):
             if isinstance(item, (dict, list)):
                 lines.append(f"{spaces}  {_pretty_format_cbor(item, indent + 1)},")
             elif isinstance(item, bytes):
-                if len(item) > 32:
-                    lines.append(f"{spaces}  <{len(item)} bytes>,")
-                else:
-                    lines.append(f"{spaces}  {item.hex()},")
+                rendered = _format_bytes(item, indent + 1)
+                # A dump ends on a hex row, where a trailing comma reads as data.
+                lines.append(f"{spaces}  {rendered}" + ("" if "\n" in rendered else ","))
             else:
                 lines.append(f"{spaces}  {item},")
         lines.append(f"{spaces}]")
         return "\n".join(lines)
     elif isinstance(obj, bytes):
-        if len(obj) > 32:
-            return f"<{len(obj)} bytes>"
-        return obj.hex()
+        return _format_bytes(obj, indent)
     else:
         return str(obj)
 
@@ -133,10 +160,19 @@ _parser.add_argument('--user-id', help="User ID in hex for make-credential (defa
 _parser.add_argument('--user-name', help="User name for make-credential (required for make-credential)")
 _parser.add_argument('--display-name', help="User display name for make-credential (default: same as --user-name)")
 _parser.add_argument('--server', help="wss://.../usb-relay/<token> URL (for usb-relay)")
+_parser.add_argument('--ble', action='store_true',
+                     help="use the BLE L2CAP data transport instead of a tunnel "
+                          "server, so the authenticator needs no internet access "
+                          "(macOS only; requires authenticator support)")
 _parser.add_argument('--hint', choices=['mc', 'ga'], help="FIDO URI command hint (mc=makeCredential, ga=getAssertion)")
 _parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO',
                      help="Logging level (DEBUG shows all raw CTAP messages and tunnel establishment)")
+_parser.add_argument('--hex', action='store_true',
+                     help=f"hex dump byte strings longer than {INLINE_BYTES_MAX} bytes "
+                          f"instead of abbreviating them as <N bytes>")
 args = _parser.parse_args()
+
+_HEX_DUMP = args.hex
 
 # Configure logging
 logging.basicConfig(
@@ -200,12 +236,20 @@ if args.command == 'usb-relay':
 def fido_encode(data):
   # CBOR-encode input dict
   cbor_data = dumps(data)
-  # group in chuncks of 7 bytes
+  # Seven-byte chunks are little-endian values encoded as 17-digit decimals.
+  # A trailing partial chunk is encoded likewise, in the minimum number of
+  # digits that some value of that length could need: 3, 5, 8, 10, 13 or 15
+  # digits for 1..6 bytes. The decoder relies on these fixed widths, so every
+  # chunk -- including the last -- must be zero-padded to its width.
+  #   https://fidoalliance.org/specs/hybrid/proximity-exchange-protocol-v1.0-wd-20260717.html
+  PARTIAL_CHUNK_DIGITS = 0x0fda8530
   n = 7
-  chunks = [cbor_data[i:i + n][::-1] for i in range(0, len(cbor_data), n)]
-  # convert chunks to decimals
-  decimals = [ str(int.from_bytes(b)) for b in chunks ]
-  return "".join( [ i.rjust(17,"0") for i in decimals[:-1]] + [ decimals[-1] ] )
+  out = []
+  for i in range(0, len(cbor_data), n):
+    chunk = cbor_data[i:i + n]
+    width = 17 if len(chunk) == n else (PARTIAL_CHUNK_DIGITS >> (4 * len(chunk))) & 15
+    out.append(str(int.from_bytes(chunk, "little")).rjust(width, "0"))
+  return "".join(out)
 
 qrSecret = secrets.token_bytes(16)
 private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
@@ -226,6 +270,11 @@ authenticatorData = {
   4: True,  # this client can perform state-assisted transactions (sctn-hybrid-state-assisted)
   5: args.hint if args.hint else ('mc' if args.command == 'make-credential' else 'ga')
 }
+if args.ble:
+  # Key 6: transport channels this client supports. 0 = websocket tunnel,
+  # 1 = BLE L2CAP. Absent means tunnel only, which is the default so that
+  # authenticators without L2CAP support are unaffected.
+  authenticatorData[6] = [0, 1]
 fido = fido_encode(authenticatorData)
 
 logging.info("FIDO:/" + fido)
@@ -238,6 +287,11 @@ keyPurposePSK      = bytes.fromhex('03000000')
 CTAP_FRAME_SHUTDOWN = 0x00
 CTAP_FRAME_CTAP     = 0x01
 CTAP_FRAME_UPDATE   = 0x02
+
+# How long to wait for a CTAP response.  This covers the whole user
+# interaction on the authenticator -- picking a credential and passing user
+# verification -- so it has to be generous rather than a network timeout.
+CTAP_RESPONSE_TIMEOUT = 120
 
 # Linking info (CTAP 2.3 sctn-hybrid-state-assisted), keyed by the
 # authenticator's public key so repeat links from the same authenticator
@@ -363,7 +417,26 @@ def _drain_update_frames(websocket, receive_cipher, handshake_hash, tunnel_serve
             break
 
 
-def _send_ctap_and_recv(websocket, send_cipher, receive_cipher, ctap_payload, handshake_hash, tunnel_server_domain):
+def _send_shutdown(websocket, send_cipher):
+    """Tell the authenticator the session is over.
+
+    Without this the authenticator has no way to know we are done: it stays in
+    the session waiting for another command, keeping its UI up ("Connecting
+    with another device") until something times out.  Over a tunnel that is the
+    websocket close; over BLE there is no in-band signal at all, so the phone
+    waits for the L2CAP link to drop and reports UNEXPECTED_EOF.
+
+    Best effort -- if the peer already went away there is nothing to tell."""
+    try:
+        frame = bytes([CTAP_FRAME_SHUTDOWN])
+        websocket.send(send_cipher.encrypt_with_ad(b"", pad_message(frame)))
+        logging.debug("SEND shutdown frame (type 0x00)")
+    except Exception as e:
+        logging.debug(f"could not send shutdown frame: {e}")
+
+
+def _send_ctap_and_recv(websocket, send_cipher, receive_cipher, ctap_payload, handshake_hash, tunnel_server_domain,
+                        timeout=CTAP_RESPONSE_TIMEOUT):
     """Send a CTAP request frame and read frames until the CTAP response,
     handling any interleaved update (linking info) messages along the way."""
     frame = bytes([CTAP_FRAME_CTAP]) + ctap_payload
@@ -372,7 +445,7 @@ def _send_ctap_and_recv(websocket, send_cipher, receive_cipher, ctap_payload, ha
     logging.debug(f"SEND CTAP encrypted ({len(encrypted)} bytes): {encrypted.hex()}")
     websocket.send(encrypted)
     while True:
-        raw = websocket.recv(timeout=10)
+        raw = websocket.recv(timeout=timeout)
         logging.debug(f"RECV encrypted frame ({len(raw)} bytes): {raw.hex()}")
         resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
         logging.debug(f"RECV decrypted frame ({len(resp)} bytes): {resp.hex()}")
@@ -392,8 +465,17 @@ if __name__ == "__main__":
     logging.debug(f"Key: {eidKey.hex()}")
 
     payload = None
-    logging.info("Scanning...")
-    while True:
+    ble_connection = None
+    if args.ble:
+        import ble_transport
+        payload, ble_connection = ble_transport.discover_and_connect(
+            lambda advert: trialDecrypt(eidKey, advert)
+        )
+        logging.info(f"Decrypted: {payload.hex()}")
+
+    if ble_connection is None:
+        logging.info("Scanning...")
+    while ble_connection is None:
         cableData = asyncio.run(scan())
         assert(len(cableData) == 20)
         logging.debug(f"BLE advert encrypted ({len(cableData)} bytes): {cableData.hex()}")
@@ -417,23 +499,37 @@ if __name__ == "__main__":
     logging.debug(f"nonce: {nonce.hex()}")
     logging.debug(f"routingID: {routingID.hex()}")
     logging.debug(f"tunnel_serviceID: {tunnel_serviceID.hex()}")
-    encodedTunnelServerDomain = tunnel_serviceID[0] + (tunnel_serviceID[1] << 8)
-    # Values zero through 255 are assigned, and values >= 256 are translated into a domain name by hashing.
-    assert(encodedTunnelServerDomain >= 0 and (encodedTunnelServerDomain < len(assignedTunnelServerDomains) or encodedTunnelServerDomain > 255))
-    if encodedTunnelServerDomain > 255:
-        tunnelServerDomain = 'cable.pyzci7hxyjsvc.org' # TODO hardcoding 0x0105 here, calculate domain name instead
+    if ble_connection is not None:
+        # BLE L2CAP: the data channel is the advertised PSM, so no tunnel
+        # server is contacted and the authenticator needs no internet access.
+        # The advert still carries a tunnel service id, but it is unused here.
+        tunnelServerDomain = None
+        transport_cm = ble_connection
     else:
-        tunnelServerDomain = assignedTunnelServerDomains[encodedTunnelServerDomain]
-    tunnelID = derive(secret=qrSecret, purpose=keyPurposeTunnelID)[:16]
+        encodedTunnelServerDomain = tunnel_serviceID[0] + (tunnel_serviceID[1] << 8)
+        # Values zero through 255 are assigned, and values >= 256 are translated into a domain name by hashing.
+        assert(encodedTunnelServerDomain >= 0 and (encodedTunnelServerDomain < len(assignedTunnelServerDomains) or encodedTunnelServerDomain > 255))
+        if encodedTunnelServerDomain > 255:
+            tunnelServerDomain = 'cable.pyzci7hxyjsvc.org' # TODO hardcoding 0x0105 here, calculate domain name instead
+        else:
+            tunnelServerDomain = assignedTunnelServerDomains[encodedTunnelServerDomain]
+        tunnelID = derive(secret=qrSecret, purpose=keyPurposeTunnelID)[:16]
 
-    connectURL = "wss://" + tunnelServerDomain + "/cable/connect/" + routingID.hex() + "/" + tunnelID.hex()
-    logging.debug(connectURL)
+        connectURL = "wss://" + tunnelServerDomain + "/cable/connect/" + routingID.hex() + "/" + tunnelID.hex()
+        logging.debug(connectURL)
 
-    with connect(connectURL, subprotocols=["fido.cable"],
-                  additional_headers={"Origin": f"wss://{tunnelServerDomain}"}) as websocket:
+        transport_cm = connect(connectURL, subprotocols=["fido.cable"],
+                               additional_headers={"Origin": f"wss://{tunnelServerDomain}"})
+
+    # Set once the handshake completes; the teardown below needs to know
+    # whether there is a session to shut down at all.
+    send_cipher = receive_cipher = handshake_hash = None
+
+    with transport_cm as websocket:
         try:
-            logging.debug(f"Tunnel connection established to {connectURL}")
-            logging.info(f"connected to {connectURL}")
+            transport_desc = "BLE L2CAP channel" if ble_connection is not None else connectURL
+            logging.debug(f"Connection established over {transport_desc}")
+            logging.info(f"connected to {transport_desc}")
 
             # PSK: salt is eid_plaintext (payload), not cableData (encrypted EID).
             # derive() is hardcoded to length=64; [:32] is safe because
@@ -593,7 +689,7 @@ if __name__ == "__main__":
                     max_attempts = 5  # Allow up to 5 non-CTAP frames before giving up
                     while attempts < max_attempts:
                         try:
-                            raw = websocket.recv(timeout=30)
+                            raw = websocket.recv(timeout=CTAP_RESPONSE_TIMEOUT)
                             logging.debug(f"RECV from tunnel encrypted ({len(raw)} bytes): {raw.hex()}")
                             resp = unpad_message(receive_cipher.decrypt_with_ad(b"", raw))
                             logging.debug(f"RECV from tunnel decrypted ({len(resp)} bytes): {resp.hex()}")
@@ -626,3 +722,11 @@ if __name__ == "__main__":
 
         except websockets.exceptions.ConnectionClosedOK as e:
             logging.info(f"Connection closed OK: {e}")
+        finally:
+            # End the session explicitly.  The authenticator may still have
+            # linking info queued behind the CTAP response, so read that out
+            # first -- an unread frame leaves it waiting just as a missing
+            # shutdown does.
+            if send_cipher is not None:
+                _drain_update_frames(websocket, receive_cipher, handshake_hash, tunnelServerDomain)
+                _send_shutdown(websocket, send_cipher)

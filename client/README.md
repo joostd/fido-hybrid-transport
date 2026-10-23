@@ -31,11 +31,49 @@ python main.py                                    # get-info (default)
 python main.py make-credential --rp-id example.com --user-name "Alice Smith"
 python main.py make-credential --rp-id example.com --user-id 0123456789abcdef --user-name "Alice"
 python main.py get-assertion --rp-id example.com
+python main.py get-assertion --rp-id example.com --ble   # BLE L2CAP, no tunnel server
 python main.py usb-relay --server wss://example.com/usb-relay/<token>
 python main.py stdio-relay --hint mc             # for OpenSSH sk-hybrid.so
 ```
 
 Run the client and scan the QR code on your iPhone or Android device.
+
+## BLE L2CAP transport (`--ble`)
+
+By default the data channel is a websocket to a tunnel server, so both devices
+need internet access. The [Proximity Exchange
+Protocol](https://fidoalliance.org/specs/hybrid/proximity-exchange-protocol-v1.0-wd-20260717.html#sctn-ble-channel)
+also allows the data channel to be a BLE L2CAP connection-oriented channel,
+which means **the authenticator needs no internet access at all**.
+
+With `--ble` the client lists transport channel 1 under key 6 of the QR code.
+An authenticator that supports it opens an insecure L2CAP CoC server socket and
+appends the PSM to its BLE advertisement as a CBOR map `{1: psm}`; the client
+then connects to that PSM instead of a tunnel server. Each message on the
+socket carries a 4-byte big-endian length prefix. Everything above the
+transport -- the Noise handshake, CTAP framing and commands -- is unchanged.
+
+Tested with a Pixel 6a (Android 17, Play services 26.41.30) in aeroplane
+mode with Bluetooth on, returning a `getAssertion` with `CTAP2_OK`:
+
+```
+$ python main.py get-assertion --rp-id google.com --ble
+[INFO] Scanning for BLE advert (L2CAP transport)...
+[INFO] BLE advert matched (rssi -39), PSM 166
+[INFO] L2CAP channel open (PSM 166)
+[INFO] connected to BLE L2CAP channel
+[INFO] Noise handshake complete.
+[INFO] Post-handshake cached features: ['dc', 'ctap']
+[INFO] CTAP2 authenticatorGetAssertion response: 0x00 (CTAP2_OK)
+```
+
+Omit `--ble` and the behaviour is exactly as before.
+
+**macOS only for now.** CoreBluetooth is the only route to L2CAP there, since
+`bleak` has no L2CAP support and Python's `socket` module has no
+`AF_BLUETOOTH` on macOS. On Linux the equivalent would be
+`socket.socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP)` — not implemented
+here because it is untested.
 
 You can also use the authenticator in [../authenticator](../authenticator) with the FIDO: URI.
 
